@@ -170,6 +170,22 @@ class TurboQuantCache:
     def seen_tokens(self):
         return self._seen_tokens
 
+    @property
+    def is_compileable(self):
+        return False
+
+    @property
+    def batch_repeat_interleave(self):
+        return None
+
+    @property
+    def key_cache(self):
+        return self._key_cache
+
+    @property
+    def value_cache(self):
+        return self._value_cache
+
     def get_memory_usage_bytes(self) -> int:
         """Estimate compressed memory usage in bytes."""
         total = 0
