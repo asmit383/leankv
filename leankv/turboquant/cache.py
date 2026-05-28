@@ -1,8 +1,8 @@
 """
 TurboQuantCache — KV cache with quantization for HuggingFace models.
 
-Implements the Cache interface directly (no DynamicCache dependency) to
-work across transformers versions.
+Implements the full Cache interface via duck typing to work across
+transformers versions without depending on Cache base class internals.
 
 Usage:
     cache = TurboQuantCache(bits=3, head_dim=128, num_layers=32, device="cuda")
@@ -23,6 +23,9 @@ class TurboQuantCache:
 
     Memory savings: 16-bit -> N-bit per coordinate, ~4.5x at 3.5 bits.
     """
+
+    is_compileable = False
+    layer_type = None
 
     def __init__(
         self,
@@ -67,6 +70,8 @@ class TurboQuantCache:
         self._key_cache: list[torch.Tensor] = []
         self._value_cache: list[torch.Tensor] = []
 
+    # ── Core cache operations ───────────────────────────────────────────
+
     def update(
         self,
         key_states: torch.Tensor,
@@ -85,7 +90,6 @@ class TurboQuantCache:
         Returns:
             (all_keys, all_values) — dequantized full cache for attention.
         """
-        # Track tokens seen (only count from layer 0 to avoid double counting)
         if layer_idx == 0:
             self._seen_tokens += key_states.shape[2]
 
@@ -125,58 +129,70 @@ class TurboQuantCache:
         parts = [quantizer.dequantize(q) for q in compressed_list]
         return torch.cat(parts, dim=2)  # concat along seq_len dim
 
+    # ── Interface methods HF generation code calls ──────────────────────
+
     def get_seq_length(self, layer_idx: int = 0) -> int:
-        """Return the current sequence length in the cache."""
         if layer_idx < len(self._key_cache) and self._key_cache[layer_idx].numel() > 0:
             return self._key_cache[layer_idx].shape[2]
         return 0
 
-    def get_max_cache_shape(self) -> int:
-        """Required by some transformers versions."""
+    def get_mask_sizes(self, query_length: int, layer_idx: int = 0):
+        """Return (kv_length, kv_offset) for attention mask construction."""
+        kv_length = self.get_seq_length(layer_idx) + query_length
+        kv_offset = 0  # no sliding window
+        return kv_length, kv_offset
+
+    def get_max_cache_shape(self, *args, **kwargs):
         return None
 
-    def get_max_length(self) -> int:
-        """No fixed max length."""
+    def get_max_length(self):
         return None
 
-    def __len__(self) -> int:
-        return len(self._key_cache)
+    def has_previous_state(self, layer_idx=None):
+        if layer_idx is not None:
+            return layer_idx < len(self._key_cache) and self._key_cache[layer_idx].numel() > 0
+        return len(self._key_cache) > 0
 
-    def __getitem__(self, layer_idx: int):
-        """Allow indexing: cache[layer_idx] -> (keys, values)."""
-        if layer_idx < len(self._key_cache):
-            return (
-                self._key_cache[layer_idx].to(self._dtype),
-                self._value_cache[layer_idx].to(self._dtype),
-            )
-        raise IndexError(f"Layer {layer_idx} not in cache (have {len(self._key_cache)} layers)")
-
-    def __iter__(self):
-        """Iterate over (key, value) pairs per layer."""
+    def crop(self, max_length: int):
+        """Crop cache to max_length (for beam search compatibility)."""
         for i in range(len(self._key_cache)):
-            yield (
-                self._key_cache[i].to(self._dtype),
-                self._value_cache[i].to(self._dtype),
-            )
+            if self._key_cache[i].numel() > 0 and self._key_cache[i].shape[2] > max_length:
+                self._key_cache[i] = self._key_cache[i][:, :, :max_length, :]
+                self._value_cache[i] = self._value_cache[i][:, :, :max_length, :]
 
-    def to_legacy_cache(self):
-        """Convert to tuple format for older transformers versions."""
-        return tuple(
-            (k.to(self._dtype), v.to(self._dtype))
-            for k, v in zip(self._key_cache, self._value_cache)
-        )
+    def batch_repeat_interleave(self, repeats: int):
+        """Repeat cache entries for beam search."""
+        for i in range(len(self._key_cache)):
+            if self._key_cache[i].numel() > 0:
+                self._key_cache[i] = self._key_cache[i].repeat_interleave(repeats, dim=0)
+                self._value_cache[i] = self._value_cache[i].repeat_interleave(repeats, dim=0)
+
+    def batch_select_indices(self, indices: torch.Tensor):
+        """Select specific batch entries."""
+        for i in range(len(self._key_cache)):
+            if self._key_cache[i].numel() > 0:
+                self._key_cache[i] = self._key_cache[i][indices]
+                self._value_cache[i] = self._value_cache[i][indices]
+
+    def reorder_cache(self, beam_idx: torch.LongTensor):
+        """Reorder cache for beam search."""
+        for i in range(len(self._key_cache)):
+            if self._key_cache[i].numel() > 0:
+                self._key_cache[i] = self._key_cache[i].index_select(0, beam_idx.to(self._key_cache[i].device))
+                self._value_cache[i] = self._value_cache[i].index_select(0, beam_idx.to(self._value_cache[i].device))
+
+    def reset(self):
+        self._key_cache.clear()
+        self._value_cache.clear()
+        self._compressed_keys = [[] for _ in range(self.num_layers)]
+        self._compressed_values = [[] for _ in range(self.num_layers)]
+        self._seen_tokens = 0
+
+    # ── Properties ──────────────────────────────────────────────────────
 
     @property
     def seen_tokens(self):
         return self._seen_tokens
-
-    @property
-    def is_compileable(self):
-        return False
-
-    @property
-    def batch_repeat_interleave(self):
-        return None
 
     @property
     def key_cache(self):
@@ -186,8 +202,58 @@ class TurboQuantCache:
     def value_cache(self):
         return self._value_cache
 
+    @property
+    def is_initialized(self):
+        return len(self._key_cache) > 0
+
+    @property
+    def is_sliding(self):
+        return [False] * self.num_layers
+
+    @property
+    def max_batch_size(self):
+        if self._key_cache and self._key_cache[0].numel() > 0:
+            return self._key_cache[0].shape[0]
+        return 0
+
+    @property
+    def max_cache_len(self):
+        if self._key_cache and self._key_cache[0].numel() > 0:
+            return self._key_cache[0].shape[2]
+        return 0
+
+    # ── Container protocol ──────────────────────────────────────────────
+
+    def __len__(self) -> int:
+        return len(self._key_cache)
+
+    def __getitem__(self, layer_idx: int):
+        if layer_idx < len(self._key_cache):
+            return (
+                self._key_cache[layer_idx].to(self._dtype),
+                self._value_cache[layer_idx].to(self._dtype),
+            )
+        raise IndexError(f"Layer {layer_idx} not in cache")
+
+    def __iter__(self):
+        for i in range(len(self._key_cache)):
+            yield (
+                self._key_cache[i].to(self._dtype),
+                self._value_cache[i].to(self._dtype),
+            )
+
+    def __bool__(self):
+        return True
+
+    def to_legacy_cache(self):
+        return tuple(
+            (k.to(self._dtype), v.to(self._dtype))
+            for k, v in zip(self._key_cache, self._value_cache)
+        )
+
+    # ── Diagnostics ─────────────────────────────────────────────────────
+
     def get_memory_usage_bytes(self) -> int:
-        """Estimate compressed memory usage in bytes."""
         total = 0
         for layer_keys in self._compressed_keys:
             for q in layer_keys:
@@ -198,11 +264,3 @@ class TurboQuantCache:
                 total += q.indices.numel()
                 total += q.norms.numel() * 4
         return total
-
-    def reset(self):
-        """Clear all cached data."""
-        self._key_cache.clear()
-        self._value_cache.clear()
-        self._compressed_keys = [[] for _ in range(self.num_layers)]
-        self._compressed_values = [[] for _ in range(self.num_layers)]
-        self._seen_tokens = 0
