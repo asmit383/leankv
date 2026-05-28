@@ -10,12 +10,11 @@ Usage:
 """
 
 import torch
-from transformers.cache_utils import Cache
 
 from .quantizer import TurboQuantMSE
 
 
-class TurboQuantCache(Cache):
+class TurboQuantCache:
     """
     KV cache that compresses keys and values using TurboQuant MSE quantization.
 
@@ -34,7 +33,6 @@ class TurboQuantCache(Cache):
         dtype: torch.dtype = torch.float16,
         seed: int = 42,
     ):
-        super().__init__()
         self.bits = bits
         self.head_dim = head_dim
         self.num_layers = num_layers
