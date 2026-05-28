@@ -26,7 +26,7 @@ def print_system_info():
     print(f"Transformers:  {transformers.__version__}")
     print(f"CUDA:          {torch.version.cuda}")
     print(f"GPU:           {torch.cuda.get_device_name(0)}")
-    print(f"GPU Memory:    {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB")
+    print(f"GPU Memory:    {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
     print("=" * 60)
 
 
@@ -77,7 +77,7 @@ def main():
 
     print(f"\nLoading {args.model}...")
     model = AutoModelForCausalLM.from_pretrained(
-        args.model, dtype=torch.float16, device_map="cuda"
+        args.model, torch_dtype=torch.float16, device_map="cuda"
     )
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     tokenizer.pad_token = tokenizer.pad_token or tokenizer.eos_token
