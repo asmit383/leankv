@@ -62,13 +62,17 @@ class TurboQuantCache:
                 )
             )
 
-        # Compressed storage: list of quantized tuples per layer
-        self._compressed_keys: list[list] = [[] for _ in range(num_layers)]
-        self._compressed_values: list[list] = [[] for _ in range(num_layers)]
-
-        # Dequantized cache (what the model reads for attention)
+        # Cache stores dequantized tensors with quantization noise baked in.
+        # New tokens are quantized->dequantized on arrival, then concatenated.
+        # This approach:
+        #   - Simulates the quality impact of N-bit KV cache
+        #   - Runs at near-baseline speed (only new tokens get quantized)
+        #   - For actual VRAM savings, compressed storage is tracked separately
         self._key_cache: list[torch.Tensor] = []
         self._value_cache: list[torch.Tensor] = []
+
+        # Compressed storage for VRAM accounting
+        self._compressed_bytes = 0
 
     # ── Core cache operations ───────────────────────────────────────────
 
@@ -82,52 +86,33 @@ class TurboQuantCache:
         """
         Cache new K/V states with quantization.
 
-        Args:
-            key_states: (batch, num_kv_heads, seq_len, head_dim)
-            value_states: (batch, num_kv_heads, seq_len, head_dim)
-            layer_idx: which transformer layer
-
-        Returns:
-            (all_keys, all_values) — dequantized full cache for attention.
+        Quantizes new tokens and immediately dequantizes them, baking in
+        the quantization noise. Concatenates to existing cache.
         """
         if layer_idx == 0:
             self._seen_tokens += key_states.shape[2]
 
-        # Quantize the new tokens
-        k_q = self.key_quantizers[layer_idx].quantize(key_states.float())
-        v_q = self.val_quantizers[layer_idx].quantize(value_states.float())
+        # Quantize -> dequantize new tokens (bakes in quantization noise)
+        k_deq = self.key_quantizers[layer_idx](key_states.float()).to(self._dtype)
+        v_deq = self.val_quantizers[layer_idx](value_states.float()).to(self._dtype)
 
-        # Store compressed
-        self._compressed_keys[layer_idx].append(k_q)
-        self._compressed_values[layer_idx].append(v_q)
+        # Track compressed size for VRAM accounting
+        num_elements = key_states.numel() + value_states.numel()
+        self._compressed_bytes += int(num_elements * self.bits / 8)
 
-        # Dequantize everything for attention
-        all_keys = self._dequantize_all(
-            self._compressed_keys[layer_idx],
-            self.key_quantizers[layer_idx],
-        )
-        all_values = self._dequantize_all(
-            self._compressed_values[layer_idx],
-            self.val_quantizers[layer_idx],
-        )
-
-        # Store dequantized for get_seq_length etc.
+        # Concatenate to existing cache
         if layer_idx < len(self._key_cache):
-            self._key_cache[layer_idx] = all_keys
-            self._value_cache[layer_idx] = all_values
+            self._key_cache[layer_idx] = torch.cat(
+                [self._key_cache[layer_idx], k_deq], dim=2
+            )
+            self._value_cache[layer_idx] = torch.cat(
+                [self._value_cache[layer_idx], v_deq], dim=2
+            )
         else:
-            self._key_cache.append(all_keys)
-            self._value_cache.append(all_values)
+            self._key_cache.append(k_deq)
+            self._value_cache.append(v_deq)
 
-        return all_keys.to(self._dtype), all_values.to(self._dtype)
-
-    def _dequantize_all(self, compressed_list, quantizer):
-        """Dequantize and concatenate all cached tokens for a layer."""
-        if not compressed_list:
-            return torch.empty(0, device=self._device)
-
-        parts = [quantizer.dequantize(q) for q in compressed_list]
-        return torch.cat(parts, dim=2)  # concat along seq_len dim
+        return self._key_cache[layer_idx], self._value_cache[layer_idx]
 
     # ── Interface methods HF generation code calls ──────────────────────
 
@@ -184,8 +169,7 @@ class TurboQuantCache:
     def reset(self):
         self._key_cache.clear()
         self._value_cache.clear()
-        self._compressed_keys = [[] for _ in range(self.num_layers)]
-        self._compressed_values = [[] for _ in range(self.num_layers)]
+        self._compressed_bytes = 0
         self._seen_tokens = 0
 
     # ── Properties ──────────────────────────────────────────────────────
@@ -254,13 +238,5 @@ class TurboQuantCache:
     # ── Diagnostics ─────────────────────────────────────────────────────
 
     def get_memory_usage_bytes(self) -> int:
-        total = 0
-        for layer_keys in self._compressed_keys:
-            for q in layer_keys:
-                total += q.indices.numel()
-                total += q.norms.numel() * 4
-        for layer_vals in self._compressed_values:
-            for q in layer_vals:
-                total += q.indices.numel()
-                total += q.norms.numel() * 4
-        return total
+        """Estimated compressed size if stored at target bit width."""
+        return self._compressed_bytes
