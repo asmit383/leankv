@@ -1,9 +1,8 @@
 """
-TurboQuantCache — HuggingFace DynamicCache subclass with KV cache quantization.
+TurboQuantCache — KV cache with quantization for HuggingFace models.
 
-This is the integration layer that makes TurboQuant work with model.generate().
-HuggingFace calls cache.update() every token during generation. We override it
-to quantize K/V on write and dequantize on read.
+Implements the Cache interface directly (no DynamicCache dependency) to
+work across transformers versions.
 
 Usage:
     cache = TurboQuantCache(bits=3, head_dim=128, num_layers=32, device="cuda")
@@ -11,24 +10,19 @@ Usage:
 """
 
 import torch
-from transformers import DynamicCache
+from transformers.cache_utils import Cache
 
-from .quantizer import TurboQuantMSE, ProdQuantized
+from .quantizer import TurboQuantMSE
 
 
-class TurboQuantCache(DynamicCache):
+class TurboQuantCache(Cache):
     """
-    KV cache that compresses keys and values using TurboQuant.
+    KV cache that compresses keys and values using TurboQuant MSE quantization.
 
-    Keys are quantized using TurboQuantMSE (optimized for MSE distortion).
-    Values are also quantized using TurboQuantMSE.
+    On each update(), incoming K/V states are quantized and stored compressed.
+    The full dequantized cache is returned for attention computation.
 
-    We use MSE quantization (not ProdQuantized) for simplicity in the cache —
-    the inner product optimization from Algorithm 2 requires modifying the
-    attention computation itself, which we can add later. MSE quantization at
-    3.5 bits is already quality-neutral per the paper.
-
-    Memory savings: 16-bit → N-bit per coordinate, so ~4.5x at 3.5 bits.
+    Memory savings: 16-bit -> N-bit per coordinate, ~4.5x at 3.5 bits.
     """
 
     def __init__(
@@ -36,7 +30,7 @@ class TurboQuantCache(DynamicCache):
         bits: int = 3,
         head_dim: int = 128,
         num_layers: int = 32,
-        device: torch.device = None,
+        device=None,
         dtype: torch.dtype = torch.float16,
         seed: int = 42,
     ):
@@ -48,6 +42,7 @@ class TurboQuantCache(DynamicCache):
             "cuda" if torch.cuda.is_available() else "cpu"
         )
         self._dtype = dtype
+        self._seen_tokens = 0
 
         # Per-layer quantizers for keys and values (separate rotations)
         self.key_quantizers = []
@@ -70,6 +65,10 @@ class TurboQuantCache(DynamicCache):
         self._compressed_keys: list[list] = [[] for _ in range(num_layers)]
         self._compressed_values: list[list] = [[] for _ in range(num_layers)]
 
+        # Dequantized cache (what the model reads for attention)
+        self._key_cache: list[torch.Tensor] = []
+        self._value_cache: list[torch.Tensor] = []
+
     def update(
         self,
         key_states: torch.Tensor,
@@ -83,12 +82,15 @@ class TurboQuantCache(DynamicCache):
         Args:
             key_states: (batch, num_kv_heads, seq_len, head_dim)
             value_states: (batch, num_kv_heads, seq_len, head_dim)
-            layer_idx: which transformer layer this belongs to
+            layer_idx: which transformer layer
 
         Returns:
-            Tuple of (all_keys, all_values) — dequantized full cache for
-            attention computation.
+            (all_keys, all_values) — dequantized full cache for attention.
         """
+        # Track tokens seen (only count from layer 0 to avoid double counting)
+        if layer_idx == 0:
+            self._seen_tokens += key_states.shape[2]
+
         # Quantize the new tokens
         k_q = self.key_quantizers[layer_idx].quantize(key_states.float())
         v_q = self.val_quantizers[layer_idx].quantize(value_states.float())
@@ -97,7 +99,7 @@ class TurboQuantCache(DynamicCache):
         self._compressed_keys[layer_idx].append(k_q)
         self._compressed_values[layer_idx].append(v_q)
 
-        # Dequantize everything for attention (HF expects full tensors back)
+        # Dequantize everything for attention
         all_keys = self._dequantize_all(
             self._compressed_keys[layer_idx],
             self.key_quantizers[layer_idx],
@@ -107,67 +109,86 @@ class TurboQuantCache(DynamicCache):
             self.val_quantizers[layer_idx],
         )
 
-        # Update the parent class's tracking for seq length etc.
-        # DynamicCache stores key_cache and value_cache as lists of tensors
-        if layer_idx < len(self.key_cache):
-            self.key_cache[layer_idx] = all_keys
-            self.value_cache[layer_idx] = all_values
+        # Store dequantized for get_seq_length etc.
+        if layer_idx < len(self._key_cache):
+            self._key_cache[layer_idx] = all_keys
+            self._value_cache[layer_idx] = all_values
         else:
-            self.key_cache.append(all_keys)
-            self.value_cache.append(all_values)
+            self._key_cache.append(all_keys)
+            self._value_cache.append(all_values)
 
         return all_keys.to(self._dtype), all_values.to(self._dtype)
 
     def _dequantize_all(self, compressed_list, quantizer):
         """Dequantize and concatenate all cached tokens for a layer."""
         if not compressed_list:
-            return torch.empty(0)
+            return torch.empty(0, device=self._device)
 
-        parts = []
-        for q in compressed_list:
-            parts.append(quantizer.dequantize(q))
-
+        parts = [quantizer.dequantize(q) for q in compressed_list]
         return torch.cat(parts, dim=2)  # concat along seq_len dim
 
     def get_seq_length(self, layer_idx: int = 0) -> int:
-        """Return the current sequence length stored in the cache."""
-        if layer_idx < len(self.key_cache) and self.key_cache[layer_idx].numel() > 0:
-            return self.key_cache[layer_idx].shape[2]
+        """Return the current sequence length in the cache."""
+        if layer_idx < len(self._key_cache) and self._key_cache[layer_idx].numel() > 0:
+            return self._key_cache[layer_idx].shape[2]
         return 0
+
+    def get_max_cache_shape(self) -> int:
+        """Required by some transformers versions."""
+        return None
+
+    def get_max_length(self) -> int:
+        """No fixed max length."""
+        return None
+
+    def __len__(self) -> int:
+        return len(self._key_cache)
+
+    def __getitem__(self, layer_idx: int):
+        """Allow indexing: cache[layer_idx] -> (keys, values)."""
+        if layer_idx < len(self._key_cache):
+            return (
+                self._key_cache[layer_idx].to(self._dtype),
+                self._value_cache[layer_idx].to(self._dtype),
+            )
+        raise IndexError(f"Layer {layer_idx} not in cache (have {len(self._key_cache)} layers)")
+
+    def __iter__(self):
+        """Iterate over (key, value) pairs per layer."""
+        for i in range(len(self._key_cache)):
+            yield (
+                self._key_cache[i].to(self._dtype),
+                self._value_cache[i].to(self._dtype),
+            )
+
+    def to_legacy_cache(self):
+        """Convert to tuple format for older transformers versions."""
+        return tuple(
+            (k.to(self._dtype), v.to(self._dtype))
+            for k, v in zip(self._key_cache, self._value_cache)
+        )
+
+    @property
+    def seen_tokens(self):
+        return self._seen_tokens
 
     def get_memory_usage_bytes(self) -> int:
         """Estimate compressed memory usage in bytes."""
         total = 0
         for layer_keys in self._compressed_keys:
             for q in layer_keys:
-                total += q.indices.numel()  # uint8 packed indices
-                total += q.norms.numel() * 4  # float32 norms
+                total += q.indices.numel()
+                total += q.norms.numel() * 4
         for layer_vals in self._compressed_values:
             for q in layer_vals:
                 total += q.indices.numel()
                 total += q.norms.numel() * 4
         return total
 
-    def get_compression_ratio(self) -> float:
-        """Return compression ratio vs FP16 cache."""
-        if not self._compressed_keys[0]:
-            return 0.0
-        # FP16 = 2 bytes per element
-        # Count total elements across all layers
-        total_elements = 0
-        for layer_idx in range(len(self.key_cache)):
-            if layer_idx < len(self.key_cache) and self.key_cache[layer_idx].numel() > 0:
-                total_elements += self.key_cache[layer_idx].numel()
-                total_elements += self.value_cache[layer_idx].numel()
-        fp16_bytes = total_elements * 2
-        compressed_bytes = self.get_memory_usage_bytes()
-        if compressed_bytes == 0:
-            return 0.0
-        return fp16_bytes / compressed_bytes
-
     def reset(self):
         """Clear all cached data."""
-        self.key_cache.clear()
-        self.value_cache.clear()
+        self._key_cache.clear()
+        self._value_cache.clear()
         self._compressed_keys = [[] for _ in range(self.num_layers)]
         self._compressed_values = [[] for _ in range(self.num_layers)]
+        self._seen_tokens = 0
