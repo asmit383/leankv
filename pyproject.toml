@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "leankv"
+version = "0.1.0"
+description = "TEAL + TurboQuant: Cost-Efficient LLM Inference Without Precision Drop"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1.0",
+    "transformers>=4.40.0",
+    "triton>=2.2.0",
+    "datasets>=2.19.0",
+    "lm-eval>=0.4.2",
+    "numpy>=1.24.0",
+    "pyyaml>=6.0",
+    "scipy>=1.10.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "ipython"]
+
+[tool.setuptools.packages.find]
+include = ["leankv*"]
