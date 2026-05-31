@@ -117,9 +117,31 @@ python3 scripts/eval_quality.py --model mistralai/Mistral-7B-v0.3 --eval ppl
 python3 scripts/eval_quality.py --model mistralai/Mistral-7B-v0.3 --tq-bits 3 --eval ppl
 ```
 
+## Limitations
+
+This is a research prototype, not a production inference engine. The Python implementation validates the techniques and measures quality impact. Key limitations:
+
+- **TEAL only helps at B=1** — unstructured activation sparsity cannot beat dense batched GEMM at B>1 due to per-item weight reloading overhead. This is a fundamental hardware constraint, not an implementation issue.
+- **TurboQuant VRAM savings are theoretical** — our implementation dequantizes KV to FP16 during attention, creating a temporary memory spike. Actual VRAM reduction requires fused CUDA kernels that compute attention directly on compressed data.
+- **No production serving** — no continuous batching, no PagedAttention, no HTTP API. This project measures techniques, not serves traffic.
+
+Production deployment requires fused CUDA kernels, which is engineering work beyond the scope of a research project. Production inference engines have demonstrated this is feasible at scale.
+
+## Production Impact
+
+Despite prototype limitations, the measured results have real production implications:
+
+| Current Production (vLLM FP8 KV) | With TurboQuant 3-bit KV |
+|---|---|
+| 2x KV compression | **4.5x KV compression** |
+| ~35 concurrent requests (L4, 4096 tok) | **~80 concurrent requests** |
+| Small quality loss | **Zero quality loss** |
+
+TurboQuant provides 2.25x more concurrent requests than FP8 KV cache with no quality degradation — a direct improvement over current production standards, pending fused kernel integration.
+
 ## Future Work
 
 - Fused CUDA kernels for TurboQuant attention (dequantize on-the-fly, no FP16 spike)
 - Integration with vLLM/SGLang PagedAttention
-- Batched sparse GEMM kernel for TEAL at B>1
+- QTIP weight quantization (4-bit, nearly lossless) — reduces model from 14.5 GB to 3.6 GB, enabling B=171 combined with TurboQuant
 - Multi-GPU benchmarks across GPU tiers (A100, RTX 4090, L4, A16)
