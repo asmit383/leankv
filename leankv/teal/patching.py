@@ -168,17 +168,24 @@ def _patch_linear_with_triton(linear: nn.Linear, threshold: float, sparsity: flo
 
     def sparse_forward(x):
         if x.shape[-2] == 1:
-            # Decode: use sparse GEMV
-            # Reshape for kernel: (batch, 1, hidden) -> (batch, 1, hidden)
-            batch_shape = x.shape[:-1]
-            x_flat = x.reshape(-1, 1, x.shape[-1])
-            out = sparse_gemv(x_flat, linear.weight, threshold, sparsity_bin)
-            out = out.reshape(*batch_shape, -1)
+            # Decode: use sparse GEMV (kernel only supports batch=1)
+            batch_size = x.shape[0] if x.dim() == 3 else 1
+            if batch_size == 1:
+                x_flat = x.reshape(1, 1, x.shape[-1])
+                out = sparse_gemv(x_flat, linear.weight, threshold, sparsity_bin)
+                out = out.reshape(x.shape[:-1] + (linear.weight.shape[0],))
+            else:
+                # Loop over batch items individually
+                outs = []
+                for b in range(batch_size):
+                    x_b = x[b:b+1].reshape(1, 1, x.shape[-1])
+                    outs.append(sparse_gemv(x_b, linear.weight, threshold, sparsity_bin))
+                out = torch.cat(outs, dim=0).reshape(x.shape[:-1] + (linear.weight.shape[0],))
             if linear.bias is not None:
                 out = out + linear.bias
             return out
         else:
-            # Prefill: use dense matmul (weight is column-major but matmul handles it)
+            # Prefill: use dense matmul
             return torch.nn.functional.linear(x, linear.weight, linear.bias)
 
     linear.forward = sparse_forward
