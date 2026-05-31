@@ -22,7 +22,7 @@ from typing import Optional
 from .sparse_fns import SparsifyFn, compute_threshold_for_sparsity
 
 try:
-    from .kernels.sparse_gemv import sparse_gemv, prepare_weight_for_sparse_gemv
+    from .kernels.sparse_gemv import sparse_gemv, batched_sparse_gemm, prepare_weight_for_sparse_gemv
     HAS_TRITON = True
 except ImportError:
     HAS_TRITON = False
@@ -167,16 +167,25 @@ def _patch_linear_with_triton(linear: nn.Linear, threshold: float, sparsity: flo
     original_forward = linear.forward
 
     def sparse_forward(x):
-        if x.shape[-2] == 1 and (x.shape[0] if x.dim() == 3 else 1) == 1:
-            # B=1 decode: use Triton sparse GEMV (actual speedup)
-            x_flat = x.reshape(1, 1, x.shape[-1])
-            out = sparse_gemv(x_flat, linear.weight, threshold, sparsity_bin)
-            out = out.reshape(x.shape[:-1] + (linear.weight.shape[0],))
+        if x.shape[-2] == 1:
+            # Decode mode (seq_len=1)
+            batch_size = x.shape[0] if x.dim() == 3 else 1
+            if batch_size == 1:
+                # B=1: Triton sparse GEMV (per-element sparsity, ~50%)
+                x_flat = x.reshape(1, 1, x.shape[-1])
+                out = sparse_gemv(x_flat, linear.weight, threshold, sparsity_bin)
+                out = out.reshape(x.shape[:-1] + (linear.weight.shape[0],))
+            else:
+                # B>1: batched sparse GEMM (per-element sparsity per batch item)
+                # 3D grid — all batch items run in parallel on GPU
+                x_flat = x.reshape(batch_size, x.shape[-1])
+                out = batched_sparse_gemm(x_flat, linear.weight, threshold, sparsity_bin)
+                out = out.reshape(x.shape[:-1] + (linear.weight.shape[0],))
             if linear.bias is not None:
                 out = out + linear.bias
             return out
         else:
-            # B>1 or prefill: dense matmul (TEAL doesn't help here)
+            # Prefill: dense matmul
             return torch.nn.functional.linear(x, linear.weight, linear.bias)
 
     linear.forward = sparse_forward

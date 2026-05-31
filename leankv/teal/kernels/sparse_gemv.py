@@ -1,24 +1,15 @@
 """
-Triton sparse GEMV kernel for TEAL activation sparsity.
+Triton sparse kernels for TEAL activation sparsity.
 
-Ported from FasterDecoding/TEAL (MIT License).
-https://github.com/FasterDecoding/TEAL
+Two kernels:
+  1. sparse_gemv: B=1 decode, per-element sparsity (~50%), maximum speedup
+  2. batched_sparse_gemm: B>1 decode, per-element sparsity per batch item
+     Uses 3D grid (output × input × batch) — all batch items run in parallel
 
-Core idea: compute y = sparse(x) @ W where activations below a magnitude
-threshold are skipped entirely. The kernel fuses threshold comparison with
-the matmul — never loads weight rows for zeroed activations.
+Both fuse threshold comparison with matmul — never loads weight rows
+for zeroed activations.
 
-Key optimizations:
-  - Fused mask: abs(x) > threshold computed inside kernel, no separate pass
-  - evict_last for x: kept in L2 cache (reused across thread blocks)
-  - evict_first for W: streamed through (block-specific, no reuse)
-  - SplitK: output dimension split across blocks, atomic_add to merge
-  - Autotuned: Triton finds best BLOCK_M/BLOCK_N per GPU
-
-Requires:
-  - FP16 inputs (Triton atomic_add doesn't support BF16)
-  - Column-major weights: weight.t().contiguous()
-  - Batch size 1 (GEMV, not GEMM)
+Ported from FasterDecoding/TEAL (MIT License) and extended for batching.
 """
 
 import torch
@@ -33,8 +24,9 @@ def init_to_zero(*names):
     return init_func
 
 
-# Autotune configurations — Triton tries each and picks the fastest
-_CONFIGS = [
+# ── Autotune configs ────────────────────────────────────────────────────
+
+_CONFIGS_B1 = [
     triton.Config({"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=2, pre_hook=init_to_zero("Y")),
     triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, pre_hook=init_to_zero("Y")),
     triton.Config({"BLOCK_M": 8, "BLOCK_N": 128}, num_warps=2, pre_hook=init_to_zero("Y")),
@@ -52,17 +44,26 @@ _CONFIGS = [
     triton.Config({"BLOCK_M": 16, "BLOCK_N": 512}, num_warps=4, pre_hook=init_to_zero("Y")),
 ]
 
+_CONFIGS_BATCHED = [
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=2, pre_hook=init_to_zero("Y")),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, pre_hook=init_to_zero("Y")),
+    triton.Config({"BLOCK_M": 16, "BLOCK_N": 256}, num_warps=4, pre_hook=init_to_zero("Y")),
+    triton.Config({"BLOCK_M": 32, "BLOCK_N": 256}, num_warps=4, pre_hook=init_to_zero("Y")),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 256}, num_warps=4, pre_hook=init_to_zero("Y")),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=4, pre_hook=init_to_zero("Y")),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=4, pre_hook=init_to_zero("Y")),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 256}, num_warps=4, pre_hook=init_to_zero("Y")),
+]
 
-@triton.autotune(configs=_CONFIGS, key=["CACHE_KEY_M", "CACHE_KEY_N", "BATCHSIZE", "SPARSITY_BIN"])
+
+# ── B=1 Sparse GEMV (original TEAL kernel) ─────────────────────────────
+
+@triton.autotune(configs=_CONFIGS_B1, key=["CACHE_KEY_M", "CACHE_KEY_N", "SPARSITY_BIN"])
 @triton.jit
 def _splitk_sparse_gemv_kernel(
-    Y,  # output pointer
-    A,  # weight pointer (column-major)
-    X,  # input pointer
-    threshold,  # magnitude threshold
-    N, M,  # dimensions: output_dim, input_dim
+    Y, A, X, threshold,
+    N, M,
     CACHE_KEY_N, CACHE_KEY_M,
-    BATCHSIZE: tl.constexpr,
     SPARSITY_BIN: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -77,55 +78,63 @@ def _splitk_sparse_gemv_kernel(
     X_ptr = X + rm
     Y_ptr = Y + rn
 
-    if BATCHSIZE == 1:
-        # Load input with evict_last (keep in L2 — reused across blocks)
-        x0 = tl.load(X_ptr, mask=rm < M, other=0.0, eviction_policy='evict_last')
-        # Fused threshold comparison — this IS the sparsification
-        idx = tl.abs(x0) > threshold
-        # Selectively load weights with evict_first (stream through, no reuse)
-        a = tl.load(A_ptr, mask=idx[:, None], other=0.0, eviction_policy='evict_first')
-        # Accumulate in FP32 for precision
-        acc0 = tl.sum(a.to(tl.float32) * x0.to(tl.float32)[:, None], 0)
+    x0 = tl.load(X_ptr, mask=rm < M, other=0.0, eviction_policy='evict_last')
+    idx = tl.abs(x0) > threshold
+    a = tl.load(A_ptr, mask=idx[:, None], other=0.0, eviction_policy='evict_first')
+    acc0 = tl.sum(a.to(tl.float32) * x0.to(tl.float32)[:, None], 0)
 
     rn = start_n * BLOCK_N + tl.arange(0, BLOCK_N)
     tl.atomic_add(Y_ptr, acc0, mask=rn < N)
 
 
-@triton.autotune(configs=_CONFIGS, key=["CACHE_KEY_M", "CACHE_KEY_N", "BATCHSIZE", "SPARSITY_BIN"])
+# ── B>1 Batched Sparse GEMM ────────────────────────────────────────────
+
+@triton.autotune(configs=_CONFIGS_BATCHED, key=["CACHE_KEY_M", "CACHE_KEY_N", "SPARSITY_BIN"])
 @triton.jit
-def _qkv_kernel(
-    Y, A, X,
-    threshold_q, threshold_k, threshold_v,
-    N, N_q, N_kv, M,
+def _batched_sparse_gemm_kernel(
+    Y,  # (B, N) output, contiguous
+    A,  # (M, N) weight, column-major (shared across batch)
+    X,  # (B, M) input, contiguous
+    threshold,
+    B, N, M,
     CACHE_KEY_N, CACHE_KEY_M,
-    BATCHSIZE: tl.constexpr,
     SPARSITY_BIN: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_M: tl.constexpr,
 ):
-    """Fused Q/K/V projection with per-projection thresholds."""
-    start_n = tl.program_id(0)
-    start_m = tl.program_id(1)
+    """
+    Batched sparse GEMM with per-element sparsity per batch item.
 
-    is_q = start_n * BLOCK_N < N_q
-    is_v = N_q + N_kv <= start_n * BLOCK_N
+    Grid: (N // BLOCK_N, M // BLOCK_M, B)
+    Each batch item gets its own thread blocks with its own sparsity mask.
+    Weights are shared (same A for all batch items).
+    """
+    pid_n = tl.program_id(0)  # output dim chunk
+    pid_m = tl.program_id(1)  # input dim chunk (SplitK)
+    pid_b = tl.program_id(2)  # batch item
 
-    rm = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    rn = start_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
 
-    A_ptr = A + rm[:, None] * N + rn[None, :]
-    X_ptr = X + rm
-    Y_ptr = Y + rn
+    # Pointers for this batch item
+    X_ptr = X + pid_b * M + rm
+    Y_ptr = Y + pid_b * N + rn
+    A_ptr = A + (rm[:, None] * N + rn[None, :])
 
-    threshold = tl.where(is_q, threshold_q, tl.where(is_v, threshold_v, threshold_k))
+    # Load input for this batch item
+    x0 = tl.load(X_ptr, mask=rm < M, other=0.0, eviction_policy='evict_last')
 
-    if BATCHSIZE == 1:
-        x0 = tl.load(X_ptr, mask=rm < M, other=0.0, eviction_policy='evict_last')
-        idx = tl.abs(x0) > threshold
-        a = tl.load(A_ptr, mask=idx[:, None], other=0.0, eviction_policy='evict_first')
-        acc = tl.sum(a.to(tl.float32) * x0.to(tl.float32)[:, None], 0)
+    # Per-element sparsity mask for THIS batch item
+    idx = tl.abs(x0) > threshold
 
-    rn = start_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    # Selectively load weights (skip rows where x is near-zero)
+    a = tl.load(A_ptr, mask=idx[:, None] & (rn[None, :] < N), other=0.0, eviction_policy='evict_first')
+
+    # Accumulate in FP32
+    acc = tl.sum(a.to(tl.float32) * x0.to(tl.float32)[:, None], 0)
+
+    # Atomic add for SplitK merge (per batch item output)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     tl.atomic_add(Y_ptr, acc, mask=rn < N)
 
 
@@ -138,103 +147,88 @@ def sparse_gemv(
     sparsity_bin: int = 5,
 ) -> torch.Tensor:
     """
-    Sparse GEMV: y = sparse(x) @ weight.
+    Sparse GEMV for B=1: y = sparse(x) @ weight.
 
     Args:
-        x: input tensor [batch, seq, hidden_dim] (batch and seq must be 1)
-        weight: weight matrix [output_dim, hidden_dim] (must be column-major)
-        threshold: magnitude threshold for activation sparsity
-        sparsity_bin: approximate sparsity level for kernel autotuning
+        x: [1, 1, D] input tensor
+        weight: [N, D] column-major weight matrix
+        threshold: magnitude threshold
+        sparsity_bin: for autotuning cache key
 
     Returns:
-        output tensor [batch, seq, output_dim]
+        [1, 1, N] output tensor
     """
     N, Z = weight.shape
-    beam_width, seq_len, _ = x.shape
-    assert x.shape[2] == Z
-    x = x.contiguous()
-    assert weight.stride(1) > 1, "weight must be column-major (call weight.t().contiguous())"
+    x = x.reshape(1, Z).contiguous()
+
+    output = torch.empty(1, N, device=x.device, dtype=torch.float16)
 
     grid = lambda META: (
         triton.cdiv(N, META["BLOCK_N"]),
         triton.cdiv(Z, META["BLOCK_M"]),
     )
-
-    output = torch.empty(beam_width, seq_len, N, device=x.device, dtype=torch.float16)
 
     _splitk_sparse_gemv_kernel[grid](
         output, weight, x, threshold,
         N, Z,
         N // 16, Z // 16,
-        beam_width,
         sparsity_bin,
     )
 
-    if x.dtype is not output.dtype:
-        return output.to(dtype=x.dtype)
-    return output
+    result = output.reshape(1, 1, N)
+    if x.dtype is not torch.float16:
+        result = result.to(dtype=x.dtype)
+    return result
 
 
-def sparse_qkv_gemv(
+def batched_sparse_gemm(
     x: torch.Tensor,
     weight: torch.Tensor,
-    threshold_q: float,
-    threshold_k: float,
-    threshold_v: float,
-    kv_size: int,
+    threshold: float,
     sparsity_bin: int = 5,
 ) -> torch.Tensor:
     """
-    Fused sparse Q/K/V projection with per-projection thresholds.
+    Batched sparse GEMM for B>1: Y = sparse(X) @ weight for each batch item.
+
+    Each batch item has its own per-element sparsity mask.
+    All batch items run in parallel via 3D grid.
 
     Args:
-        x: input tensor [batch, seq, hidden_dim]
-        weight: concatenated QKV weight [q_dim + k_dim + v_dim, hidden_dim]
-        threshold_q/k/v: per-projection magnitude thresholds
-        kv_size: dimension of K (and V) projection
-        sparsity_bin: for autotuning
+        x: [B, D] input tensor (batch of hidden states)
+        weight: [N, D] column-major weight matrix
+        threshold: magnitude threshold
+        sparsity_bin: for autotuning cache key
 
     Returns:
-        output tensor [batch, seq, q_dim + k_dim + v_dim]
+        [B, N] output tensor
     """
+    B_size = x.shape[0]
     N, Z = weight.shape
-    beam_width, seq_len, _ = x.shape
-    assert x.shape[2] == Z
     x = x.contiguous()
-    assert weight.stride(1) > 1, "weight must be column-major"
 
-    N_q = N - 2 * kv_size
+    output = torch.empty(B_size, N, device=x.device, dtype=torch.float16)
 
     grid = lambda META: (
         triton.cdiv(N, META["BLOCK_N"]),
         triton.cdiv(Z, META["BLOCK_M"]),
+        B_size,  # batch dimension in grid
     )
 
-    output = torch.empty(beam_width, seq_len, N, device=x.device, dtype=torch.float16)
-
-    _qkv_kernel[grid](
-        output, weight, x,
-        threshold_q, threshold_k, threshold_v,
-        N, N_q, kv_size, Z,
+    _batched_sparse_gemm_kernel[grid](
+        output, weight, x, threshold,
+        B_size, N, Z,
         N // 16, Z // 16,
-        beam_width,
         sparsity_bin,
     )
 
-    if x.dtype is not output.dtype:
-        return output.to(dtype=x.dtype)
+    if x.dtype is not torch.float16:
+        output = output.to(dtype=x.dtype)
     return output
 
 
 def prepare_weight_for_sparse_gemv(weight: torch.Tensor) -> torch.Tensor:
     """
-    Convert weight to column-major layout for the sparse GEMV kernel.
-    Call this once at model load time.
-
-    Args:
-        weight: [output_dim, input_dim] row-major tensor
-
-    Returns:
-        [output_dim, input_dim] column-major tensor
+    Convert weight to column-major layout for sparse kernels.
+    Call once at model load time.
     """
     return weight.t().contiguous().t()
