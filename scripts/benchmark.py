@@ -122,6 +122,8 @@ def main():
     parser.add_argument("--num-runs", type=int, default=5, help="Runs per measurement")
     parser.add_argument("--prompt", type=str, default="Explain the theory of relativity in simple terms.")
     parser.add_argument("--output", type=str, default=None, help="CSV output path")
+    parser.add_argument("--triton", action="store_true", help="Use Triton sparse GEMV kernels for TEAL")
+    parser.add_argument("--paged", action="store_true", help="Use FlashInfer PagedKVCache")
     args = parser.parse_args()
 
     # Resolve model
@@ -140,19 +142,34 @@ def main():
     model, tokenizer = load_model(model_name)
 
     # Apply optimizations
+    teal_kwargs = {}
+    if hasattr(args, 'triton') and args.triton:
+        teal_kwargs['use_triton'] = True
+
+    from leankv.teal.patching import apply_teal
+    if args.teal or args.teal_thresholds:
+        apply_teal(
+            model,
+            sparsity=args.teal,
+            thresholds_path=args.teal_thresholds,
+            **teal_kwargs,
+        )
+
     model, cache = optimize_model(
         model,
-        teal_sparsity=args.teal,
-        teal_thresholds_path=args.teal_thresholds,
         turboquant_bits=args.tq_bits,
+        use_paged_cache=getattr(args, 'paged', False),
     )
 
     # Build config label
     parts = ["baseline"]
     if args.teal or args.teal_thresholds:
-        parts = [f"teal_{int((args.teal or 0)*100)}pct"]
+        triton_label = "_triton" if getattr(args, 'triton', False) else ""
+        parts = [f"teal_{int((args.teal or 0)*100)}pct{triton_label}"]
     if args.tq_bits:
         parts.append(f"tq_{args.tq_bits}bit")
+    if getattr(args, 'paged', False):
+        parts.append("paged")
     config_label = "+".join(parts)
 
     print(f"\n{'='*60}")
