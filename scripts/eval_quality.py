@@ -26,7 +26,7 @@ from leankv.combined import load_model, optimize_model
 
 
 def evaluate_perplexity(
-    model, tokenizer, dataset_name="wikitext", dataset_config="wikitext-2-raw-v1",
+    model, tokenizer, dataset_name="Salesforce/wikitext", dataset_config="wikitext-2-raw-v1",
     split="test", max_length=2048, stride=512,
 ):
     """
