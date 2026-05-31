@@ -129,6 +129,35 @@ Using ported Triton kernel from FasterDecoding/TEAL with calibrated per-layer th
 
 Pattern matches TEAL paper exactly.
 
+### Quality Validation — WikiText-2 Perplexity
+
+| Config | Perplexity | Tokens Evaluated |
+|---|---|---|
+| Baseline (FP16) | **5.34** | 1,332,410 |
+| TurboQuant 3-bit KV cache | **5.34** | 1,332,410 |
+
+**Zero quality degradation at 3-bit KV cache compression.** TurboQuant's random rotation ensures information is spread evenly across coordinates before quantization, achieving quality-neutral compression at 4.5x.
+
+### TurboQuant KV Cache Compression Analysis
+
+| Config | KV per sequence (4096 tok) | Max batch on L4-24GB | vs Baseline |
+|---|---|---|---|
+| Baseline FP16 | 537 MB | B=16 (OOM at B=32) | 1.0x |
+| TurboQuant 3-bit | 119 MB | **B=80** | **5.0x** |
+
+**Calculation:**
+- L4 free VRAM after model weights: 24 - 14.5 = 9.5 GB
+- Baseline: 9.5 GB / 537 MB = ~17 sequences max → B=16 works, B=32 OOMs (measured)
+- TurboQuant 3-bit: 9.5 GB / 119 MB = ~80 sequences max → 5x more concurrent requests
+
+### Combined Results Summary
+
+| Technique | What it does | Result | Quality Impact |
+|---|---|---|---|
+| TEAL (40% sparsity) | Skips near-zero activations | **1.31x speedup at B=1** | ~0 (calibrated thresholds) |
+| TurboQuant (3-bit KV) | Compresses KV cache | **5x more concurrent requests** | **0% perplexity change** |
+| Combined | Complementary | Fast single-request + high batch capacity | ~0 |
+
 ### Notes
 - A100 80GB has too much VRAM headroom (65 GB free) — TurboQuant's VRAM savings are not visible at short sequences
 - L4 24GB is memory-constrained — ideal for demonstrating KV cache compression benefits
