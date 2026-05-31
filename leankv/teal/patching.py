@@ -21,6 +21,12 @@ from typing import Optional
 
 from .sparse_fns import SparsifyFn, compute_threshold_for_sparsity
 
+try:
+    from .kernels.sparse_gemv import sparse_gemv, prepare_weight_for_sparse_gemv
+    HAS_TRITON = True
+except ImportError:
+    HAS_TRITON = False
+
 # Projection names in the order TEAL processes them
 PROJ_NAMES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
@@ -54,6 +60,7 @@ def apply_teal(
     thresholds: Optional[dict] = None,
     thresholds_path: Optional[str] = None,
     calibration_data: Optional[list[torch.Tensor]] = None,
+    use_triton: bool = False,
 ):
     """
     Apply TEAL activation sparsity to a HuggingFace model.
@@ -63,12 +70,12 @@ def apply_teal(
     Args:
         model: HuggingFace CausalLM (LlamaForCausalLM, MistralForCausalLM, etc.)
         sparsity: uniform sparsity level (0.0 to 1.0) applied to all projections.
-            Uses a fixed threshold estimated from activation statistics.
         thresholds: dict mapping {layer_idx: {proj_name: threshold_value}}.
-            Produced by greedy_opt.py calibration.
         thresholds_path: path to JSON file containing thresholds dict.
-        calibration_data: optional list of input tensors for estimating thresholds
-            when using uniform sparsity. If None, uses a heuristic threshold.
+        calibration_data: optional list of input tensors for threshold estimation.
+        use_triton: if True, replace nn.Linear forward with Triton sparse GEMV
+            kernel for actual wall-clock speedup. Requires triton>=2.2, CUDA 12+,
+            and FP16 inputs. Falls back to hooks if Triton not available.
 
     Returns:
         dict of {(layer_idx, proj_name): SparsifyFn} for diagnostics.
@@ -78,10 +85,13 @@ def apply_teal(
             "Exactly one of sparsity, thresholds, or thresholds_path must be provided."
         )
 
+    if use_triton and not HAS_TRITON:
+        print("[TEAL] Warning: Triton not available, falling back to hook-based sparsification.")
+        use_triton = False
+
     if thresholds_path is not None:
         with open(thresholds_path, "r") as f:
             thresholds = json.load(f)
-        # Keys in JSON are strings, convert to int
         thresholds = {int(k): v for k, v in thresholds.items()}
 
     layers = _get_layers(model)
@@ -97,15 +107,12 @@ def apply_teal(
                 t = thresholds.get(layer_idx, {}).get(proj_name, 0.0)
             elif sparsity is not None and sparsity > 0:
                 if calibration_data is not None:
-                    # Estimate threshold from calibration activations
                     with torch.no_grad():
                         acts = _collect_input_activations(
                             model, proj, calibration_data
                         )
                         t = compute_threshold_for_sparsity(acts, sparsity)
                 else:
-                    # Heuristic: use sparsity as a rough threshold scale
-                    # This will be replaced by proper calibration in Step 4
                     t = sparsity * 0.1
             else:
                 t = 0.0
@@ -113,16 +120,20 @@ def apply_teal(
             sparsifier = SparsifyFn(threshold=t, enabled=(t > 0))
             sparsifiers[(layer_idx, proj_name)] = sparsifier
 
-            # Register the pre-hook: sparsify input before the Linear's forward
-            def make_hook(sf):
-                def hook_fn(module, args):
-                    x = args[0]
-                    x_sparse = sf(x)
-                    return (x_sparse,) + args[1:]
-                return hook_fn
+            if use_triton and t > 0:
+                # Replace the Linear's forward with Triton sparse GEMV
+                _patch_linear_with_triton(proj, t, sparsity or 0.4)
+            else:
+                # Hook-based: sparsify input before the Linear's forward
+                def make_hook(sf):
+                    def hook_fn(module, args):
+                        x = args[0]
+                        x_sparse = sf(x)
+                        return (x_sparse,) + args[1:]
+                    return hook_fn
 
-            handle = proj.register_forward_pre_hook(make_hook(sparsifier))
-            hooks.append(handle)
+                handle = proj.register_forward_pre_hook(make_hook(sparsifier))
+                hooks.append(handle)
 
     # Store hooks on the model for later removal
     if not hasattr(model, "_teal_hooks"):
@@ -130,7 +141,48 @@ def apply_teal(
     model._teal_hooks.extend(hooks)
     model._teal_sparsifiers = sparsifiers
 
+    if use_triton:
+        print(f"[TEAL] Using Triton sparse GEMV kernels (actual speedup)")
+    else:
+        print(f"[TEAL] Using hook-based sparsification (correctness only)")
+
     return sparsifiers
+
+
+def _patch_linear_with_triton(linear: nn.Linear, threshold: float, sparsity: float):
+    """
+    Replace a nn.Linear's forward method with Triton sparse GEMV.
+
+    Converts weight to column-major layout and replaces forward()
+    to use the fused sparse kernel during decode (seq_len=1).
+    Falls back to dense matmul during prefill (seq_len>1).
+    """
+    # Convert weight to column-major (one-time cost)
+    with torch.no_grad():
+        linear.weight.data = prepare_weight_for_sparse_gemv(linear.weight.data)
+
+    # Compute sparsity bin for autotuning (0-10 scale)
+    sparsity_bin = int(sparsity * 10)
+
+    original_forward = linear.forward
+
+    def sparse_forward(x):
+        if x.shape[-2] == 1:
+            # Decode: use sparse GEMV
+            # Reshape for kernel: (batch, 1, hidden) -> (batch, 1, hidden)
+            batch_shape = x.shape[:-1]
+            x_flat = x.reshape(-1, 1, x.shape[-1])
+            out = sparse_gemv(x_flat, linear.weight, threshold, sparsity_bin)
+            out = out.reshape(*batch_shape, -1)
+            if linear.bias is not None:
+                out = out + linear.bias
+            return out
+        else:
+            # Prefill: use dense matmul (weight is column-major but matmul handles it)
+            return torch.nn.functional.linear(x, linear.weight, linear.bias)
+
+    linear.forward = sparse_forward
+    linear._teal_patched = True
 
 
 def remove_teal(model):
