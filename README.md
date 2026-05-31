@@ -64,32 +64,64 @@ The model itself is never modified. TEAL skips work that produces near-zero resu
 
 ---
 
-## Baseline Benchmarks (Completed)
+## Benchmarks
 
-### Hardware
-- GPU: NVIDIA A100-SXM4-80GB
-- CUDA: 13.0
-- Python: 3.10.12
-- Framework: HuggingFace Transformers
-- Instance: Runcrate (hopeful-feynman)
+### Hardware Tested
+| GPU | VRAM | CUDA | Instance |
+|---|---|---|---|
+| NVIDIA A100-SXM4-80GB | 80 GB | 12.4 / 13.0 | Runcrate (hopeful-feynman, sharp-shamir) |
+| NVIDIA L4 | 24 GB | 12.4 | Runcrate |
 
-### Setup
-- Single request, 128 output tokens
-- Prompt: "Explain the theory of relativity in simple terms."
-- 5-run average after warmup
-- FP16 dtype
+### Baseline: Short Sequences (128 tokens)
 
-### Results
+**A100-80GB:**
 
 | Model | Parameters | Throughput (tok/s) | VRAM Used | 
 |---|---|---|---|
 | Mistral 7B v0.3 FP16 | 7.2B | **64.8 tok/s** | 14.5 GB |
 | Llama 3 8B FP16 | 8.0B | **58.8 tok/s** | 16.1 GB |
 
+**L4-24GB (Mistral 7B v0.3 FP16, 128 tokens):**
+
+| Batch | Total tok/s | Per-seq tok/s | VRAM |
+|---|---|---|---|
+| 1 | 16.9 | 16.9 | 14.52 GB |
+| 4 | 64.7 | 16.2 | 14.60 GB |
+| 8 | 127.2 | 15.9 | 14.66 GB |
+| 16 | 247.0 | 15.4 | 14.80 GB |
+
+### Baseline: Long Sequences (4096 tokens) — L4-24GB
+
+This is the key test: at 4096 tokens, KV cache is **537 MB per sequence** and becomes the dominant memory consumer.
+
+| Batch | Total tok/s | Per-seq tok/s | VRAM | Status |
+|---|---|---|---|---|
+| 1 | 16.4 | 16.4 | 14.90 GB | OK |
+| 4 | 57.7 | 14.4 | 16.07 GB | OK |
+| 8 | 99.4 | 12.4 | 17.64 GB | OK |
+| 16 | 154.9 | 9.7 | 20.78 GB | OK |
+| **32** | **—** | **—** | **—** | **OOM** |
+
+**KV Cache Size at 4096 tokens:** 128 KB/token × 4096 = 537 MB/sequence. B=32 needs 17.2 GB for KV cache alone → total 31.7 GB → exceeds 24 GB.
+
+**This is where TurboQuant matters:** compressing KV cache ~5x (3-bit) reduces B=32 KV from 17.2 GB to ~3.4 GB → fits in 24 GB.
+
+### TEAL Activation Sparsity Report (Mistral 7B, 40% target)
+
+Hook-based sparsification (correctness validation, no wall-clock speedup yet — requires Triton kernels):
+
+- **W_down**: 99.9% sparsity (early layers) → 31.5% (final layers) — highest, Laplacian-distributed inputs
+- **W_o**: 98.7% → 17.1% — high in early layers, variable in middle
+- **W_q/W_k/W_v**: ~77% in layer 0, drops to ~2% in deeper layers
+- **W_gate/W_up**: 1-10% — minimal sparsity, Gaussian-distributed inputs
+
+Pattern matches TEAL paper exactly. Proper calibration (greedy optimization) will replace heuristic thresholds.
+
 ### Notes
-- Llama 3 is slightly slower due to larger param count + larger vocab (128k vs 32k)
-- A100 80GB has plenty of headroom — only using ~16GB of 80GB
-- This headroom is exactly what TurboQuant exploits (compress KV cache → fit bigger batches)
+- A100 80GB has too much VRAM headroom (65 GB free) — TurboQuant's VRAM savings are not visible at short sequences
+- L4 24GB is memory-constrained — ideal for demonstrating KV cache compression benefits
+- Per-sequence throughput degrades at high batch sizes as KV cache fills VRAM (16.4 → 9.7 tok/s from B=1 to B=16)
+- TEAL hook-based implementation adds ~30% overhead (no speedup). Wall-clock gains require Triton sparse GEMV kernels (Step 6)
 
 ---
 
