@@ -22,6 +22,12 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from .teal.patching import apply_teal, remove_teal
 from .turboquant.cache import TurboQuantCache
 
+try:
+    from .turboquant.paged_cache import PagedKVCache
+    HAS_PAGED = True
+except ImportError:
+    HAS_PAGED = False
+
 
 @dataclass
 class TEALConfig:
@@ -53,19 +59,24 @@ def optimize_model(
     teal_sparsity: Optional[float] = None,
     teal_thresholds_path: Optional[str] = None,
     turboquant_bits: Optional[int] = None,
+    use_paged_cache: bool = False,
+    page_size: int = 16,
+    max_pages: int = 2048,
 ):
     """
     Apply TEAL and/or TurboQuant to a HuggingFace model.
 
     Args:
         model: HuggingFace CausalLM.
-        teal_sparsity: uniform TEAL sparsity (0.0-1.0). Mutually exclusive
-            with teal_thresholds_path.
+        teal_sparsity: uniform TEAL sparsity (0.0-1.0).
         teal_thresholds_path: path to calibrated TEAL thresholds JSON.
         turboquant_bits: KV cache quantization bits (2-4). None = no TQ.
+        use_paged_cache: use FlashInfer paged attention (requires flashinfer).
+        page_size: tokens per page (default 16).
+        max_pages: maximum number of pages in the pool.
 
     Returns:
-        (model, cache) tuple. cache is None if TurboQuant not enabled.
+        (model, cache) tuple. cache is None if no cache optimization enabled.
     """
     # Apply TEAL
     if teal_sparsity is not None or teal_thresholds_path is not None:
@@ -77,13 +88,32 @@ def optimize_model(
         label = teal_thresholds_path or f"{teal_sparsity:.0%}"
         print(f"[LeanKV] TEAL enabled (sparsity={label})")
 
-    # Create TurboQuant cache
     cache = None
-    if turboquant_bits is not None:
-        config = model.config
-        head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-        num_layers = config.num_hidden_layers
+    config = model.config
+    head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+    num_layers = config.num_hidden_layers
+    num_kv_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
+    num_q_heads = config.num_attention_heads
 
+    if use_paged_cache:
+        if not HAS_PAGED:
+            raise RuntimeError(
+                "FlashInfer not installed. Run: pip install flashinfer"
+            )
+        cache = PagedKVCache(
+            num_layers=num_layers,
+            num_kv_heads=num_kv_heads,
+            num_q_heads=num_q_heads,
+            head_dim=head_dim,
+            page_size=page_size,
+            max_pages=max_pages,
+            device=model.device,
+            dtype=torch.float16,
+        )
+        pool_mb = cache.get_total_pool_mb()
+        print(f"[LeanKV] PagedKVCache enabled (pages={max_pages}, "
+              f"page_size={page_size}, pool={pool_mb:.0f} MB)")
+    elif turboquant_bits is not None:
         cache = TurboQuantCache(
             bits=turboquant_bits,
             head_dim=head_dim,
