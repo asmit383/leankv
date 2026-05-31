@@ -167,36 +167,16 @@ def _patch_linear_with_triton(linear: nn.Linear, threshold: float, sparsity: flo
     original_forward = linear.forward
 
     def sparse_forward(x):
-        if x.shape[-2] == 1:
-            # Decode mode
-            batch_size = x.shape[0] if x.dim() == 3 else 1
-            if batch_size == 1:
-                # B=1: use Triton sparse GEMV (fastest path)
-                x_flat = x.reshape(1, 1, x.shape[-1])
-                out = sparse_gemv(x_flat, linear.weight, threshold, sparsity_bin)
-                out = out.reshape(x.shape[:-1] + (linear.weight.shape[0],))
-            else:
-                # B>1: shared column mask + smaller dense matmul
-                # Find columns where ALL batch items are near-zero → skip those
-                x_2d = x.reshape(batch_size, x.shape[-1])  # (B, D)
-                col_max = x_2d.abs().max(dim=0).values  # (D,) max magnitude per column
-                keep_mask = col_max > threshold  # columns to keep
-                n_keep = keep_mask.sum().item()
-
-                if n_keep < x_2d.shape[-1] * 0.95:
-                    # Enough sparsity to be worth it — do smaller dense matmul
-                    x_sparse = x_2d[:, keep_mask]  # (B, n_keep)
-                    w_sparse = linear.weight[:, keep_mask]  # (out_dim, n_keep)
-                    out = torch.matmul(x_sparse, w_sparse.t())  # (B, out_dim)
-                    out = out.reshape(x.shape[:-1] + (linear.weight.shape[0],))
-                else:
-                    # Not enough sparsity — full dense matmul
-                    out = torch.nn.functional.linear(x, linear.weight, None)
+        if x.shape[-2] == 1 and (x.shape[0] if x.dim() == 3 else 1) == 1:
+            # B=1 decode: use Triton sparse GEMV (actual speedup)
+            x_flat = x.reshape(1, 1, x.shape[-1])
+            out = sparse_gemv(x_flat, linear.weight, threshold, sparsity_bin)
+            out = out.reshape(x.shape[:-1] + (linear.weight.shape[0],))
             if linear.bias is not None:
                 out = out + linear.bias
             return out
         else:
-            # Prefill: dense matmul
+            # B>1 or prefill: dense matmul (TEAL doesn't help here)
             return torch.nn.functional.linear(x, linear.weight, linear.bias)
 
     linear.forward = sparse_forward
