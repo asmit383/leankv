@@ -47,21 +47,24 @@ def evaluate_perplexity(
 
     seq_len = input_ids.shape[1]
     nlls = []
-    prev_end = 0
+    total_tokens = 0
 
     for begin in range(0, seq_len, stride):
         end = min(begin + max_length, seq_len)
-        target_len = end - prev_end  # number of new tokens to score
 
         input_chunk = input_ids[:, begin:end]
+        chunk_len = input_chunk.shape[1]
+
+        if chunk_len <= 1:
+            break
 
         with torch.no_grad():
             outputs = model(input_chunk)
             logits = outputs.logits
 
-        # Only score the new tokens (not the overlap)
-        shift_logits = logits[:, -target_len - 1 : -1, :].contiguous()
-        shift_labels = input_chunk[:, -target_len:].contiguous()
+        # Standard next-token prediction: predict token[i+1] from token[i]
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = input_chunk[:, 1:].contiguous()
 
         loss_fn = CrossEntropyLoss(reduction="none")
         loss = loss_fn(
@@ -69,13 +72,12 @@ def evaluate_perplexity(
             shift_labels.view(-1),
         )
         nlls.append(loss.sum().item())
+        total_tokens += shift_labels.numel()
 
-        prev_end = end
         if end >= seq_len:
             break
 
     total_nll = sum(nlls)
-    total_tokens = prev_end - 0  # approximate
     ppl = math.exp(total_nll / total_tokens)
     print(f"[Eval] Perplexity = {ppl:.2f} ({total_tokens} tokens)")
     return ppl
