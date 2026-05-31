@@ -106,22 +106,34 @@ This is the key test: at 4096 tokens, KV cache is **537 MB per sequence** and be
 
 **This is where TurboQuant matters:** compressing KV cache ~5x (3-bit) reduces B=32 KV from 17.2 GB to ~3.4 GB → fits in 24 GB.
 
-### TEAL Activation Sparsity Report (Mistral 7B, 40% target)
+### TEAL with Triton Sparse GEMV (Mistral 7B, 40% sparsity, calibrated) — L4-24GB
 
-Hook-based sparsification (correctness validation, no wall-clock speedup yet — requires Triton kernels):
+Using ported Triton kernel from FasterDecoding/TEAL with calibrated per-layer thresholds (206/224 projections active):
 
-- **W_down**: 99.9% sparsity (early layers) → 31.5% (final layers) — highest, Laplacian-distributed inputs
-- **W_o**: 98.7% → 17.1% — high in early layers, variable in middle
+| Batch | Baseline tok/s | TEAL tok/s | Speedup |
+|---|---|---|---|
+| **1** | **16.9** | **22.2** | **1.31x** |
+| 4 | 64.7 | 66.2 | 1.02x |
+| 8 | 127.2 | 129.8 | 1.02x |
+| 16 | 247.0 | 253.1 | 1.02x |
+
+**B=1: 1.31x speedup** — real wall-clock improvement from Triton sparse GEMV kernel.
+**B>1: neutral** — kernel automatically falls back to dense matmul (TEAL is a B=1 technique per the paper's finding on batch scaling).
+
+### TEAL Sparsity Distribution (Mistral 7B)
+
+- **W_down**: 99.9% → 31.5% sparsity (highest — Laplacian-distributed inputs)
+- **W_o**: 98.7% → 17.1% (high in early layers, variable in middle)
 - **W_q/W_k/W_v**: ~77% in layer 0, drops to ~2% in deeper layers
-- **W_gate/W_up**: 1-10% — minimal sparsity, Gaussian-distributed inputs
+- **W_gate/W_up**: 1-10% (minimal — Gaussian-distributed inputs)
 
-Pattern matches TEAL paper exactly. Proper calibration (greedy optimization) will replace heuristic thresholds.
+Pattern matches TEAL paper exactly.
 
 ### Notes
 - A100 80GB has too much VRAM headroom (65 GB free) — TurboQuant's VRAM savings are not visible at short sequences
 - L4 24GB is memory-constrained — ideal for demonstrating KV cache compression benefits
 - Per-sequence throughput degrades at high batch sizes as KV cache fills VRAM (16.4 → 9.7 tok/s from B=1 to B=16)
-- TEAL hook-based implementation adds ~30% overhead (no speedup). Wall-clock gains require Triton sparse GEMV kernels (Step 6)
+- TEAL helps at B=1 (compute-bound), TurboQuant helps at B>1 with long sequences (memory-bound) — complementary
 
 ---
 
