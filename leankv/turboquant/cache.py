@@ -1,16 +1,18 @@
 """
-TurboQuantCache — KV cache with real compressed storage.
+TurboQuantCache — Hybrid KV cache with compressed cold storage + FP16 hot buffer.
 
-Stores KV cache as quantized indices (uint8) + norms (float32) in GPU memory.
-Only dequantizes transiently when attention needs the full tensors.
+Memory layout:
+  - Hot buffer: last N tokens in FP16 (fast, no dequant needed)
+  - Cold storage: older tokens as quantized indices (uint8) + norms (float32)
+  - On attention: dequantize cold + concat hot = full KV for attention
 
-Memory layout per token per head:
-  FP16:       128 dims × 2 bytes = 256 bytes
-  3-bit TQ:   128 dims × 3 bits / 8 = 48 bytes (indices) + 4 bytes (norm) = 52 bytes
-  Savings:    ~5x
+This gives both VRAM savings AND near-baseline speed:
+  - New tokens: quantize→dequantize (1 token, cheap) → append to hot buffer
+  - When hot buffer exceeds N: flush oldest to cold compressed storage
+  - Attention: dequantize cold (done once per layer) + hot buffer
 
-Peak VRAM = model weights + compressed KV (all layers) + 1 layer dequantized (transient)
-vs baseline = model weights + full FP16 KV (all layers)
+Peak VRAM = model + compressed cold KV + hot buffer (N tokens FP16) + 1 layer dequantized cold
+vs baseline = model + full FP16 KV (all layers, all tokens)
 
 Usage:
     cache = TurboQuantCache(bits=3, head_dim=128, num_layers=32, device="cuda")
@@ -24,12 +26,7 @@ from .quantizer import TurboQuantMSE, MSEQuantized
 
 class TurboQuantCache:
     """
-    KV cache with real compressed storage using TurboQuant MSE quantization.
-
-    Stores only quantized indices (uint8) and norms (float32) persistently.
-    Dequantizes on-the-fly when update() is called, returning full tensors
-    for attention. These transient tensors are freed after each layer's
-    forward pass completes.
+    Hybrid KV cache: compressed cold storage + FP16 hot buffer.
     """
 
     is_compileable = False
@@ -40,6 +37,7 @@ class TurboQuantCache:
         bits: int = 3,
         head_dim: int = 128,
         num_layers: int = 32,
+        hot_buffer_size: int = 64,
         device=None,
         dtype: torch.dtype = torch.float16,
         seed: int = 42,
@@ -47,6 +45,7 @@ class TurboQuantCache:
         self.bits = bits
         self.head_dim = head_dim
         self.num_layers = num_layers
+        self.hot_buffer_size = hot_buffer_size
         self._device = device or torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
         )
@@ -54,7 +53,7 @@ class TurboQuantCache:
         self._seen_tokens = 0
         self._seq_lengths = [0] * num_layers
 
-        # Per-layer quantizers for keys and values (separate rotations)
+        # Per-layer quantizers
         self.key_quantizers = []
         self.val_quantizers = []
         for i in range(num_layers):
@@ -71,23 +70,16 @@ class TurboQuantCache:
                 )
             )
 
-        # Compressed storage: single MSEQuantized per layer (concatenated indices + norms)
-        # We merge chunks on arrival to avoid O(n) dequantization of separate chunks
-        self._compressed_keys: list[MSEQuantized | None] = [None] * num_layers
-        self._compressed_values: list[MSEQuantized | None] = [None] * num_layers
+        # Cold storage: compressed (old tokens)
+        self._cold_keys: list[MSEQuantized | None] = [None] * num_layers
+        self._cold_values: list[MSEQuantized | None] = [None] * num_layers
+        self._cold_lengths: list[int] = [0] * num_layers
+
+        # Hot buffer: FP16 (recent tokens)
+        self._hot_keys: list[torch.Tensor | None] = [None] * num_layers
+        self._hot_values: list[torch.Tensor | None] = [None] * num_layers
 
     # ── Core cache operations ───────────────────────────────────────────
-
-    def _merge_quantized(self, existing: MSEQuantized | None, new: MSEQuantized) -> MSEQuantized:
-        """Merge two quantized representations by concatenating along seq dim."""
-        if existing is None:
-            return new
-        # indices: (..., packed_len) — concat along seq dimension
-        # For packed indices, seq is embedded in the batch dims before packed_len
-        # Shape is (batch, heads, seq, packed_len_per_token)
-        merged_indices = torch.cat([existing.indices, new.indices], dim=2)
-        merged_norms = torch.cat([existing.norms, new.norms], dim=2)
-        return MSEQuantized(indices=merged_indices, norms=merged_norms, bits=new.bits)
 
     def update(
         self,
@@ -97,45 +89,104 @@ class TurboQuantCache:
         cache_kwargs=None,
     ):
         """
-        Cache new K/V states with real compressed storage.
+        Cache new K/V states using hybrid hot/cold storage.
 
-        1. Quantize new tokens → merge into compressed storage
-        2. Dequantize full compressed cache → return for attention
-        3. Returned tensors are transient — freed after attention uses them
-
-        Args:
-            key_states: (batch, num_kv_heads, seq_len, head_dim)
-            value_states: (batch, num_kv_heads, seq_len, head_dim)
-            layer_idx: which transformer layer
-
-        Returns:
-            (all_keys, all_values) — transient dequantized tensors for attention
+        New tokens go to the FP16 hot buffer. When hot buffer exceeds
+        hot_buffer_size, oldest tokens are flushed to compressed cold storage.
+        Returns full cache (cold dequantized + hot) for attention.
         """
         if layer_idx == 0:
             self._seen_tokens += key_states.shape[2]
 
-        # Quantize new tokens
-        k_q = self.key_quantizers[layer_idx].quantize(key_states.float())
-        v_q = self.val_quantizers[layer_idx].quantize(value_states.float())
+        new_seq = key_states.shape[2]
+        self._seq_lengths[layer_idx] += new_seq
 
-        # Merge into single compressed representation per layer
-        self._compressed_keys[layer_idx] = self._merge_quantized(
-            self._compressed_keys[layer_idx], k_q
-        )
-        self._compressed_values[layer_idx] = self._merge_quantized(
-            self._compressed_values[layer_idx], v_q
-        )
-        self._seq_lengths[layer_idx] += key_states.shape[2]
+        # Append new tokens to hot buffer
+        k_new = key_states.to(self._dtype)
+        v_new = value_states.to(self._dtype)
 
-        # Dequantize full cache for attention (transient)
-        all_keys = self.key_quantizers[layer_idx].dequantize(
-            self._compressed_keys[layer_idx]
-        )
-        all_values = self.val_quantizers[layer_idx].dequantize(
-            self._compressed_values[layer_idx]
+        if self._hot_keys[layer_idx] is None:
+            self._hot_keys[layer_idx] = k_new
+            self._hot_values[layer_idx] = v_new
+        else:
+            self._hot_keys[layer_idx] = torch.cat(
+                [self._hot_keys[layer_idx], k_new], dim=2
+            )
+            self._hot_values[layer_idx] = torch.cat(
+                [self._hot_values[layer_idx], v_new], dim=2
+            )
+
+        # Flush to cold if hot buffer exceeds limit
+        hot_len = self._hot_keys[layer_idx].shape[2]
+        if hot_len > self.hot_buffer_size:
+            self._flush_to_cold(layer_idx)
+
+        # Build full cache for attention: cold (dequantized) + hot
+        all_keys, all_values = self._get_full_cache(layer_idx)
+
+        return all_keys, all_values
+
+    def _flush_to_cold(self, layer_idx: int):
+        """Move tokens beyond hot_buffer_size from hot buffer to cold storage."""
+        hot_k = self._hot_keys[layer_idx]
+        hot_v = self._hot_values[layer_idx]
+        hot_len = hot_k.shape[2]
+
+        # Keep last hot_buffer_size tokens in hot, flush the rest to cold
+        flush_len = hot_len - self.hot_buffer_size
+        flush_k = hot_k[:, :, :flush_len, :]
+        flush_v = hot_v[:, :, :flush_len, :]
+
+        # Quantize flushed tokens
+        k_q = self.key_quantizers[layer_idx].quantize(flush_k.float())
+        v_q = self.val_quantizers[layer_idx].quantize(flush_v.float())
+
+        # Merge into cold storage
+        if self._cold_keys[layer_idx] is None:
+            self._cold_keys[layer_idx] = k_q
+            self._cold_values[layer_idx] = v_q
+        else:
+            self._cold_keys[layer_idx] = self._merge_quantized(
+                self._cold_keys[layer_idx], k_q
+            )
+            self._cold_values[layer_idx] = self._merge_quantized(
+                self._cold_values[layer_idx], v_q
+            )
+        self._cold_lengths[layer_idx] += flush_len
+
+        # Trim hot buffer
+        self._hot_keys[layer_idx] = hot_k[:, :, flush_len:, :].contiguous()
+        self._hot_values[layer_idx] = hot_v[:, :, flush_len:, :].contiguous()
+
+    def _merge_quantized(self, a: MSEQuantized, b: MSEQuantized) -> MSEQuantized:
+        """Merge two quantized representations along seq dimension."""
+        return MSEQuantized(
+            indices=torch.cat([a.indices, b.indices], dim=2),
+            norms=torch.cat([a.norms, b.norms], dim=2),
+            bits=a.bits,
         )
 
-        return all_keys.to(self._dtype), all_values.to(self._dtype)
+    def _get_full_cache(self, layer_idx: int):
+        """Dequantize cold + concat hot for full attention cache."""
+        hot_k = self._hot_keys[layer_idx]
+        hot_v = self._hot_values[layer_idx]
+
+        if self._cold_keys[layer_idx] is not None:
+            # Dequantize cold storage
+            cold_k = self.key_quantizers[layer_idx].dequantize(
+                self._cold_keys[layer_idx]
+            ).to(self._dtype)
+            cold_v = self.val_quantizers[layer_idx].dequantize(
+                self._cold_values[layer_idx]
+            ).to(self._dtype)
+            # Concat: cold (old) + hot (recent)
+            all_keys = torch.cat([cold_k, hot_k], dim=2)
+            all_values = torch.cat([cold_v, hot_v], dim=2)
+        else:
+            all_keys = hot_k
+            all_values = hot_v
+
+        return all_keys, all_values
 
     # ── Interface methods HF generation code calls ──────────────────────
 
@@ -161,10 +212,10 @@ class TurboQuantCache:
         return any(s > 0 for s in self._seq_lengths)
 
     def crop(self, max_length: int):
-        pass  # not supported with compressed storage
+        pass
 
     def batch_repeat_interleave(self, repeats: int):
-        pass  # beam search not supported yet
+        pass
 
     def batch_select_indices(self, indices: torch.Tensor):
         pass
@@ -173,8 +224,11 @@ class TurboQuantCache:
         pass
 
     def reset(self):
-        self._compressed_keys = [None] * self.num_layers
-        self._compressed_values = [None] * self.num_layers
+        self._cold_keys = [None] * self.num_layers
+        self._cold_values = [None] * self.num_layers
+        self._cold_lengths = [0] * self.num_layers
+        self._hot_keys = [None] * self.num_layers
+        self._hot_values = [None] * self.num_layers
         self._seq_lengths = [0] * self.num_layers
         self._seen_tokens = 0
 
@@ -186,8 +240,6 @@ class TurboQuantCache:
 
     @property
     def key_cache(self):
-        # Return list of empty tensors — real data is in compressed storage
-        # HF checks len(key_cache) to determine number of cached layers
         return [torch.empty(0, device=self._device)] * len([s for s in self._seq_lengths if s > 0])
 
     @property
@@ -204,9 +256,9 @@ class TurboQuantCache:
 
     @property
     def max_batch_size(self):
-        for q in self._compressed_keys:
-            if q is not None:
-                return q.norms.shape[0]
+        for k in self._hot_keys:
+            if k is not None:
+                return k.shape[0]
         return 0
 
     @property
@@ -219,20 +271,14 @@ class TurboQuantCache:
         return len([s for s in self._seq_lengths if s > 0])
 
     def __getitem__(self, layer_idx: int):
-        if self._seq_lengths[layer_idx] > 0 and self._compressed_keys[layer_idx] is not None:
-            keys = self.key_quantizers[layer_idx].dequantize(
-                self._compressed_keys[layer_idx]
-            )
-            values = self.val_quantizers[layer_idx].dequantize(
-                self._compressed_values[layer_idx]
-            )
-            return keys.to(self._dtype), values.to(self._dtype)
+        if self._seq_lengths[layer_idx] > 0:
+            return self._get_full_cache(layer_idx)
         raise IndexError(f"Layer {layer_idx} not in cache")
 
     def __iter__(self):
         for i in range(self.num_layers):
             if self._seq_lengths[i] > 0:
-                yield self[i]
+                yield self._get_full_cache(i)
 
     def __bool__(self):
         return True
@@ -241,49 +287,65 @@ class TurboQuantCache:
         result = []
         for i in range(self.num_layers):
             if self._seq_lengths[i] > 0:
-                k, v = self[i]
-                result.append((k, v))
+                result.append(self._get_full_cache(i))
         return tuple(result)
 
     # ── Diagnostics ─────────────────────────────────────────────────────
 
     def get_compressed_memory_bytes(self) -> int:
-        """Actual compressed memory usage on GPU in bytes."""
+        """Memory used by cold compressed storage."""
         total = 0
-        for q in self._compressed_keys:
+        for q in self._cold_keys:
             if q is not None:
                 total += q.indices.numel() * q.indices.element_size()
                 total += q.norms.numel() * q.norms.element_size()
-        for q in self._compressed_values:
+        for q in self._cold_values:
             if q is not None:
                 total += q.indices.numel() * q.indices.element_size()
                 total += q.norms.numel() * q.norms.element_size()
         return total
 
+    def get_hot_memory_bytes(self) -> int:
+        """Memory used by hot FP16 buffer."""
+        total = 0
+        for k in self._hot_keys:
+            if k is not None:
+                total += k.numel() * k.element_size()
+        for v in self._hot_values:
+            if v is not None:
+                total += v.numel() * v.element_size()
+        return total
+
+    def get_total_cache_bytes(self) -> int:
+        """Total cache memory (compressed cold + FP16 hot)."""
+        return self.get_compressed_memory_bytes() + self.get_hot_memory_bytes()
+
     def get_fp16_equivalent_bytes(self) -> int:
-        """What the same cache would cost in FP16."""
-        total_elements = 0
+        """What the same cache would cost entirely in FP16."""
+        total = 0
         for i, s in enumerate(self._seq_lengths):
-            if s > 0 and self._compressed_keys[i] is not None:
-                norms = self._compressed_keys[i].norms
-                batch = norms.shape[0]
-                heads = norms.shape[1] if norms.dim() > 1 else 1
-                total_elements += batch * heads * s * self.head_dim * 2  # K + V
-        return total_elements * 2  # FP16 = 2 bytes
+            if s > 0 and self._hot_keys[i] is not None:
+                batch = self._hot_keys[i].shape[0]
+                heads = self._hot_keys[i].shape[1]
+                total += batch * heads * s * self.head_dim * 2  # K + V
+        return total * 2  # FP16 = 2 bytes
 
     def get_compression_ratio(self) -> float:
-        compressed = self.get_compressed_memory_bytes()
-        if compressed == 0:
+        actual = self.get_total_cache_bytes()
+        if actual == 0:
             return 0.0
         fp16 = self.get_fp16_equivalent_bytes()
-        return fp16 / compressed
+        return fp16 / actual
 
     def print_memory_report(self):
-        compressed_mb = self.get_compressed_memory_bytes() / 1e6
+        cold_mb = self.get_compressed_memory_bytes() / 1e6
+        hot_mb = self.get_hot_memory_bytes() / 1e6
+        total_mb = self.get_total_cache_bytes() / 1e6
         fp16_mb = self.get_fp16_equivalent_bytes() / 1e6
         ratio = self.get_compression_ratio()
         seq_len = max(self._seq_lengths) if self._seq_lengths else 0
-        print(f"[TurboQuantCache] seq_len={seq_len}, "
-              f"compressed={compressed_mb:.1f} MB, "
-              f"FP16 equivalent={fp16_mb:.1f} MB, "
-              f"ratio={ratio:.1f}x")
+        cold_len = max(self._cold_lengths) if self._cold_lengths else 0
+        hot_len = seq_len - cold_len
+        print(f"[TurboQuantCache] seq={seq_len} (cold={cold_len}, hot={hot_len}), "
+              f"actual={total_mb:.1f} MB (cold={cold_mb:.1f} + hot={hot_mb:.1f}), "
+              f"FP16 equiv={fp16_mb:.1f} MB, ratio={ratio:.1f}x")
