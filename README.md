@@ -1,147 +1,95 @@
-# LeanKV: TEAL + TurboQuant for Cost-Efficient LLM Inference
+# LeanKV — hand-written CUDA kernels for batch-1 LLM decode
 
-Two training-free, complementary optimization techniques for LLM inference:
+Batch-1 decode is **memory-bandwidth bound**: each projection is a matrix–vector
+product where the GPU spends all its time moving the weight matrix through HBM.
+This repo takes that kernel from **Triton** down to **raw CUDA** (one level lower),
+then adds **int4 weights** — the byte-reduction lever a plain fp16 kernel can't reach.
 
-- **TEAL** — activation sparsity, reduces compute per token
-- **TurboQuant** — KV cache compression (16-bit to 3-bit), reduces memory
+All numbers measured on **NVIDIA L4** (300 GB/s HBM), shape 14336×4096, 40% activation sparsity.
 
-Model weights stay FP16. No retraining required.
+## The comparison
 
-## Papers
+| kernel | level | time/call | bandwidth | vs Triton | correct? |
+|---|---|---:|---:|---:|:--:|
+| **Triton fp16** (starting point) | Triton DSL | 0.275 ms | 85% | 1.0× | ✓ |
+| **CUDA fp16** (hand-written) | raw CUDA | 0.280 ms | 84% | ties | ✓ (1e-5) |
+| **CUDA int4** (fused sparse+quant) | raw CUDA | **0.087 ms** | 70% | **~3.2×** | ✓ (1e-5) |
 
-| Paper | Venue | What |
-|---|---|---|
-| [TEAL](https://arxiv.org/abs/2408.14690) | ICLR 2025 Spotlight | Magnitude-based activation sparsity |
-| [TurboQuant](https://arxiv.org/abs/2504.19874) | arXiv 2025 | KV cache quantization via random rotation + scalar quantizers |
+- **fp16: raw CUDA ties Triton.** Both saturate the same HBM wall — the point was to
+  reach it by hand, and it does (85%→84%, matching output to 1e-5).
+- **int4: raw CUDA beats Triton ~3.2×.** 4× fewer weight bytes → ~3.2× faster at
+  batch-1. This is the lever Triton-fp16 has no way to pull.
 
-## Results (Measured)
+## Why go below Triton
 
-All benchmarks on **NVIDIA L4 24GB**, Mistral 7B v0.3 FP16, via Runcrate.
+Triton can't be beaten at fp16 (both hit HBM). It *can* do int4 — but the fast
+int4 unpack (`LOP3` bit-trick), custom bit-packing, and fusing dequant with the
+sparsity skip need instruction-level control Triton won't emit. The state-of-the-art
+int4 kernel (Marlin) is hand-written CUDA for exactly this reason.
 
-### TEAL: 1.31x Speedup at B=1
-
-Triton sparse GEMV kernel with calibrated per-layer thresholds (40% sparsity, 206/224 projections active):
-
-| Batch | Baseline tok/s | TEAL tok/s | Speedup |
-|---|---|---|---|
-| **1** | **16.9** | **22.2** | **1.31x** |
-| 4 | 64.8 | 66.2 | 1.02x |
-| 8 | 127.7 | 129.8 | 1.02x |
-| 16 | 248.1 | 253.1 | 1.02x |
-
-TEAL is a B=1 technique. At B>1 the sparse GEMV kernel cannot beat dense batched GEMM (weight reloading overhead), so it falls back to dense matmul automatically.
-
-### TurboQuant: Zero Quality Loss at 4.5x Compression
-
-WikiText-2 perplexity (1.3M tokens):
-
-| Config | Perplexity |
-|---|---|
-| Baseline FP16 | **5.34** |
-| TurboQuant 3-bit | **5.34** |
-
-### TurboQuant: 5x More Concurrent Requests
-
-At 4096 tokens, KV cache = 537 MB/sequence (FP16). On L4-24GB (9.5 GB free after model):
-
-| Config | KV per sequence | Max batch | Measured |
-|---|---|---|---|
-| Baseline FP16 | 537 MB | B=16 | B=32 OOMs |
-| TurboQuant 3-bit | 119 MB | B=80 | — |
-
-Baseline B=32 OOM confirmed by benchmark. TurboQuant capacity is theoretical (requires fused CUDA kernels for on-the-fly dequantization during attention).
-
-### Baseline: Long Sequences (4096 tokens)
-
-| Batch | Total tok/s | Per-seq tok/s | VRAM | Status |
-|---|---|---|---|---|
-| 1 | 16.4 | 16.4 | 14.90 GB | OK |
-| 4 | 57.7 | 14.4 | 16.07 GB | OK |
-| 8 | 99.4 | 12.4 | 17.64 GB | OK |
-| 16 | 154.9 | 9.7 | 20.78 GB | OK |
-| 32 | — | — | — | OOM |
-
-## Key Findings
-
-1. **TEAL and TurboQuant are complementary** — TEAL reduces compute (B=1), TurboQuant reduces memory (B>1)
-2. **TEAL does not scale to B>1** — unstructured activation sparsity cannot beat dense batched GEMM due to per-item weight reloading
-3. **TurboQuant is quality-neutral at 3-bit** — random rotation spreads information evenly before quantization
-4. **Actual VRAM savings require fused CUDA kernels** — Python dequantize-during-attention creates temporary FP16 spikes that negate savings
-
-## Architecture
+## The fused sparse-int4 kernel, in one line
 
 ```
-leankv/
-├── teal/
-│   ├── sparse_fns.py          # magnitude-based activation masking
-│   ├── patching.py            # monkey-patch HF models with sparsity
-│   ├── calibration.py         # activation histogram collection
-│   ├── greedy_opt.py          # per-layer sparsity allocation
-│   └── kernels/
-│       └── sparse_gemv.py     # Triton sparse GEMV (ported from TEAL repo)
-├── turboquant/
-│   ├── codebook.py            # Lloyd-Max codebook for Beta distribution
-│   ├── rotation.py            # random orthogonal rotation + QJL
-│   ├── quantizer.py           # TurboQuantMSE quantize/dequantize
-│   └── cache.py               # HF-compatible KV cache with compression
-├── combined.py                # unified API
-└── utils.py                   # VRAM tracking, timing
-
-scripts/
-├── raw_baseline.py            # standalone baseline benchmark
-├── benchmark.py               # TEAL + TurboQuant benchmark
-├── calibrate.py               # TEAL threshold calibration
-└── eval_quality.py            # perplexity evaluation
+y[n] = Σ_k ( |x[k]| > t ?  x[k] · dequant_int4(Wq[k,n])  : 0 )
 ```
 
-## Usage
+Two wins in one pass, in registers:
+- **Sparsity** — skip whole weight rows for zeroed activations
+- **int4** — weights stay packed in HBM (0.5 B vs fp16's 2 B), unpacked in registers,
+  never written back as fp16
+
+## In-model correctness
+
+The kernel drives **all 154 projections** of a real model during decode, vs an fp32
+ground-truth forward: cosine **0.99994** (PyTorch dense is 0.99996), argmax token
+matches, generated text identical. It tracks ground truth as tightly as PyTorch's
+own dense path.
+
+## Where the kernels live
+
+```
+leankv/teal/kernels/
+├── sparse_gemv.py            # original Triton kernel (the starting point)
+└── cuda/                     # this work — see cuda/README.md for details
+    ├── sparse_gemv.cu        # fp16 kernel + bandwidth benchmark
+    ├── sparse_int4_gemv.cu   # fused sparse-int4 kernel (the headline)
+    ├── forward_test.py       # in-model correctness vs fp32 ground truth
+    ├── bench_forward.py      # end-to-end decode tok/s
+    ├── sparse_gemv_hip.cpp   # HIP/CDNA port for AMD MI300X
+    └── DESIGN_sparse_int4.md # design + phase plan
+```
+
+## Build
 
 ```bash
-# Install
-pip install torch transformers accelerate scipy pyyaml triton datasets
-pip install .
-
-# Baseline
-python3 scripts/raw_baseline.py --batch-sizes 1 4 8 16
-
-# Calibrate TEAL (one-time, ~15 min)
-python3 scripts/calibrate.py --model mistralai/Mistral-7B-v0.3 --sparsity 0.4 --samples 100
-
-# TEAL with Triton kernel
-python3 scripts/benchmark.py --model mistralai/Mistral-7B-v0.3 \
-  --teal-thresholds thresholds/mistral_7b_v0.3/thresholds_s40.json \
-  --triton --batch-sizes 1
-
-# Quality evaluation
-python3 scripts/eval_quality.py --model mistralai/Mistral-7B-v0.3 --eval ppl
-python3 scripts/eval_quality.py --model mistralai/Mistral-7B-v0.3 --tq-bits 3 --eval ppl
+nvcc -O3 -arch=sm_89 leankv/teal/kernels/cuda/sparse_gemv.cu      -o k && ./k
+nvcc -O3 -arch=sm_89 leankv/teal/kernels/cuda/sparse_int4_gemv.cu -o k && ./k
 ```
 
-## Limitations
+## Status (honest)
 
-This is a research prototype, not a production inference engine. The Python implementation validates the techniques and measures quality impact. Key limitations:
+- int4 kernel is **standalone-tested** (correct, 3.2× at kernel level). End-to-end
+  int4 tok/s harness is committed but **not yet run**.
+- int4 uses a **naive unpack**; the `LOP3` optimization (raises the 70% back up) is next.
+- int4 **weight-quant quality** (perplexity) not yet measured — separate axis.
+- HIP kernel is **not run on AMD hardware** yet (no MI300X). All numbers are NVIDIA L4.
 
-- **TEAL only helps at B=1** — unstructured activation sparsity cannot beat dense batched GEMM at B>1 due to per-item weight reloading overhead. This is a fundamental hardware constraint, not an implementation issue.
-- **TurboQuant VRAM savings are theoretical** — our implementation dequantizes KV to FP16 during attention, creating a temporary memory spike. Actual VRAM reduction requires fused CUDA kernels that compute attention directly on compressed data.
-- **No production serving** — no continuous batching, no PagedAttention, no HTTP API. This project measures techniques, not serves traffic.
+---
 
-Production deployment requires fused CUDA kernels, which is engineering work beyond the scope of a research project. Production inference engines have demonstrated this is feasible at scale.
+<details>
+<summary><b>Background: the original LeanKV research (TEAL + TurboQuant)</b></summary>
 
-## Production Impact
+Two training-free inference optimizations, the foundation this kernel work builds on:
 
-Despite prototype limitations, the measured results have real production implications:
+- **TEAL** — magnitude-based activation sparsity ([ICLR 2025](https://arxiv.org/abs/2408.14690)).
+  Zeroes small activations so the GEMV can skip weight rows. **1.31× at B=1** on
+  Mistral-7B (16.9 → 22.2 tok/s, L4) with calibrated thresholds. B=1 only — at B>1,
+  dense batched GEMM wins.
+- **TurboQuant** — KV-cache compression to 3-bit via random rotation ([arXiv 2025](https://arxiv.org/abs/2504.19874)).
+  **4.5× compression, zero perplexity loss** (WikiText-2: 5.34 both FP16 and 3-bit).
 
-| Current Production (vLLM FP8 KV) | With TurboQuant 3-bit KV |
-|---|---|
-| 2x KV compression | **4.5x KV compression** |
-| ~35 concurrent requests (L4, 4096 tok) | **~80 concurrent requests** |
-| Small quality loss | **Zero quality loss** |
+Modules: `leankv/teal/` (sparsity), `leankv/turboquant/` (KV compression),
+`scripts/` (calibration, benchmarks, quality eval). Both are research prototypes;
+the CUDA kernels above are the step toward the fused kernels production needs.
 
-TurboQuant provides 2.25x more concurrent requests than FP8 KV cache with no quality degradation — a direct improvement over current production standards, pending fused kernel integration.
-
-## Future Work
-
-- Fused CUDA kernels for TurboQuant attention (dequantize on-the-fly, no FP16 spike)
-- Integration with vLLM/SGLang PagedAttention
-- QTIP weight quantization (4-bit, nearly lossless) — reduces model from 14.5 GB to 3.6 GB, enabling B=171 combined with TurboQuant
-- Multi-GPU benchmarks across GPU tiers (A100, RTX 4090, L4, A16)
+</details>
