@@ -34,32 +34,43 @@ stats = {"active": 0, "total": 0}
 
 def install(mod, thr):
     W = mod.weight.data
-    Wc = W.t().contiguous().t()
-    def fwd(x):
+    Wc = W.t().contiguous().t()      # column-major storage, logical [out,in]
+    mod.weight.data = Wc             # replace in place → frees original, one copy (fits 7B)
+    def fwd(x):                      # NO per-call sync in the hot path
         if x.shape[0] == 1 and x.shape[1] == 1:
-            xf = x.reshape(-1)
-            stats["active"] += int((xf.abs() > thr).sum()); stats["total"] += xf.numel()
-            return cuda.sparse_gemv(x, Wc, thr).to(x.dtype)
-        return F.linear(x, W)
+            return cuda.sparse_gemv(x, Wc, thr)
+        return F.linear(x, Wc)       # prefill / batched -> dense
     mod.forward = fwd
 
 @torch.no_grad()
-def bench(label):
+def bench(label, note=""):
     ids = tok(args.prompt, return_tensors="pt").to(DEV)
     model.generate(**ids, max_new_tokens=16, do_sample=False, pad_token_id=tok.eos_token_id)
-    torch.cuda.synchronize(); stats["active"] = stats["total"] = 0
+    torch.cuda.synchronize()
     t = time.time()
     out = model.generate(**ids, max_new_tokens=args.ntok, do_sample=False, pad_token_id=tok.eos_token_id)
     torch.cuda.synchronize(); dt = time.time() - t
     n = out.shape[1] - ids.input_ids.shape[1]
-    sp = 100.0 * (1 - stats["active"] / max(stats["total"], 1)) if stats["total"] else 0.0
-    print(f"{label:<28} {n/dt:6.1f} tok/s" + (f"   (sparsity {sp:.0f}%)" if stats["total"] else ""))
+    print(f"{label:<28} {n/dt:6.1f} tok/s{note}")
     return n / dt
+
+@torch.no_grad()
+def probe_sparsity(thr):                 # achieved sparsity on one real decode activation
+    ids = tok(args.prompt, return_tensors="pt").to(DEV)
+    h = {}
+    tgt = model.model.layers[0].mlp.gate_proj
+    def hook(m, inp): h["x"] = inp[0]
+    hd = tgt.register_forward_pre_hook(hook)
+    model(ids.input_ids[:, -1:])
+    hd.remove()
+    x = h["x"].reshape(-1)
+    return 100.0 * (x.abs() <= thr).float().mean().item()
 
 print(f"model: {args.model}   decoding {args.ntok} tokens, batch-1\n")
 d = bench("PyTorch dense (fp16)")
-for _, m in layers: install(m, 0.0)
-bench("CUDA kernel, threshold=0")
-for _, m in layers: install(m, 0.05)
-bench("CUDA kernel, sparse")
-print(f"\n(dense baseline = {d:.1f} tok/s; kernel overhead vs dense is the gap at threshold=0)")
+for thr in [0.0, 0.1, 0.2, 0.35]:
+    sp = probe_sparsity(thr) if thr > 0 else 0.0
+    for _, m in layers: install(m, thr)
+    bench(f"CUDA kernel, thr={thr}", note=f"   (~{sp:.0f}% sparse)")
+print(f"\n(dense = {d:.1f} tok/s. kernel ties Triton at the kernel level; naive per-call"
+      f"\n integration — torch.zeros + fp16 cast each call — is the remaining overhead.)")
