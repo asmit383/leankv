@@ -38,6 +38,18 @@ Two wins in one pass, in registers:
 - **int4** — weights stay packed in HBM (0.5 B vs fp16's 2 B), unpacked in registers,
   never written back as fp16
 
+## End-to-end on Mistral-7B (batch-1 decode tok/s)
+
+| config | tok/s | vs dense |
+|---|---:|---:|
+| PyTorch dense fp16 | 16.7 | 1.0× |
+| **sparse-int4, no sparsity** | **17.8** | **1.07×** |
+| sparse-int4 + sparsity | up to **24.2** | up to **1.45×** |
+
+int4 alone beats dense *even with naive wrapper overhead* (the fp16 kernel couldn't —
+it fell to 12.8). With sparsity it passes the Triton fp16 result (22.2). Sparsity here
+is uncalibrated and int4 has its own quality cost — this is a speed measurement.
+
 ## In-model correctness
 
 The kernel drives **all 154 projections** of a real model during decode, vs an fp32
@@ -68,8 +80,8 @@ nvcc -O3 -arch=sm_89 leankv/teal/kernels/cuda/sparse_int4_gemv.cu -o k && ./k
 
 ## Status (honest)
 
-- int4 kernel is **standalone-tested** (correct, 3.2× at kernel level). End-to-end
-  int4 tok/s harness is committed but **not yet run**.
+- int4 kernel: standalone-tested (3.2× kernel-level) **and** end-to-end on Mistral-7B
+  (1.07× dense at int4 alone, up to 1.45× with sparsity — beats Triton's 22.2 tok/s).
 - int4 uses a **naive unpack**; the `LOP3` optimization (raises the 70% back up) is next.
 - int4 **weight-quant quality** (perplexity) not yet measured — separate axis.
 - HIP kernel is **not run on AMD hardware** yet (no MI300X). All numbers are NVIDIA L4.
