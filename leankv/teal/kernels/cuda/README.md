@@ -51,7 +51,9 @@ registers (never written back as fp16). Symmetric, group-wise (G=128), 2 nibbles
 
 - int4 kernel is **standalone-tested** (correct, 3.2× at kernel level). **End-to-end
   int4 tok/s not yet run** (`bench_int4_forward.py` is committed but untested).
-- int4 uses a **naive unpack**; `LOP3` optimization is next (raises the 70% back up).
+- int4 **LOP3 unpack** implemented & verified (`sparse_int4_gemv_lop3.cu`): ~1.06× over
+  naive, +4–5 pts bandwidth (70→74% at 40%, 76→81% dense). Modest — near the memory wall.
+  Dequant in fp16 (speed) → higher rounding than the fp32 naive path.
 - int4 **weight-quant quality** (perplexity) not yet measured — separate axis.
 - HIP kernel **not run on AMD hardware** (no MI300X yet). All numbers are NVIDIA L4.
 
