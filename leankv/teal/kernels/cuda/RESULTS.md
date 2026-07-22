@@ -79,6 +79,26 @@ cost, not weight traffic. This is the honest ceiling for fusion in this regime.
 | `fused_gate_up.cu` | fused SwiGLU projection benchmark |
 | `sparse_gemv_hip.cpp` | HIP/CDNA port (untested on AMD hardware) |
 
+## Fused sparse-int4 GEMV — the byte-reduction lever (beats Triton)
+
+`sparse_int4_gemv.cu`: one kernel fusing activation sparsity + int4 weight
+dequant. Weights are int4 (symmetric, group-wise G=128), packed 2/byte,
+column-major; unpacked in registers (naive shift/mask for now — LOP3 next) so
+they never round-trip HBM as fp16.
+
+| sparsity | int4 time | fp16 sparse time | speedup | int4 bw util | rel err |
+|---------:|----------:|-----------------:|--------:|-------------:|--------:|
+| 0%       | 0.133 ms  | ~0.46 ms         | ~3.4×   | 76%          | 9e-5    |
+| 40%      | 0.087 ms  | 0.281 ms         | 3.25×   | 70%          | 1e-5    |
+| 60%      | 0.064 ms  | ~0.19 ms         | ~3.0×   | 63%          | 3e-5    |
+
+int4 moves 4× fewer weight bytes (17.6 MB vs 70.4 MB at 40%). Since the fp16
+kernel *ties* Triton, this is **~3.3× faster than Triton at B=1** — the lever
+Triton-fp16 doesn't have. bw% falls as sparsity rises because the naive unpack
+becomes compute-bound; the LOP3 unpack (next) pushes it back toward memory-bound.
+Correct to ~1e-5 vs the dequant-then-GEMV reference. int4 weight-quant quality is
+a separate axis (measure end-to-end perplexity before claiming quality).
+
 ## What actually raises throughput at B=1
 
 The kernel is at the HBM wall (~85%); raising utilization further buys little.
