@@ -43,12 +43,21 @@ Two wins in one pass, in registers:
 | config | tok/s | vs dense |
 |---|---:|---:|
 | PyTorch dense fp16 | 16.7 | 1.0× |
-| **sparse-int4, no sparsity** | **17.8** | **1.07×** |
-| sparse-int4 + sparsity | up to **24.2** | up to **1.45×** |
+| Triton fp16 sparse (leankv original) | 22.2 | 1.31× |
+| int4, unfused | 17.8 | 1.07× |
+| **fused int4** (QKV + gate/up in one kernel) | **27.1** | **1.62×** |
+| fused int4 + sparsity | **35.4** | **2.12×** |
 
-int4 alone beats dense *even with naive wrapper overhead* (the fp16 kernel couldn't —
-it fell to 12.8). With sparsity it passes the Triton fp16 result (22.2). Sparsity here
-is uncalibrated and int4 has its own quality cost — this is a speed measurement.
+Fusing the projections that share an input (q/k/v; gate/up) into single concatenated
+int4 GEMVs takes int4 from 17.8 → 27.1 (+52%): fewer, bigger kernels → better
+occupancy. The 27.1 (1.62×) case is coherent (beats the Triton fp16 result); the
+2.12× case adds uncalibrated sparsity (speed only — int4 quant + sparsity quality is
+a separate axis). Memory ceiling on L4 is ~85 tok/s (dense int4).
+
+**CUDA graphs were a dead end here** (`bench_int4_graph.py`): once correct (a kernel
+must launch on the capture stream, not the default stream, or the graph is empty),
+graph replay is only ~1.02× — batch-1 decode on a 7B is GPU-bound, not
+launch-overhead-bound. The real lever was kernel fusion, above.
 
 ## In-model correctness
 

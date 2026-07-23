@@ -18,10 +18,11 @@ ap.add_argument("--model", default="mistralai/Mistral-7B-v0.3")
 ap.add_argument("--ntok", type=int, default=128)
 ap.add_argument("--thr", type=float, default=0.2)
 ap.add_argument("--prompt", default="Explain memory-bound GPU kernels in detail:")
+ap.add_argument("--fp16", action="store_true", help="skip int4 ext, capture stock fp16 model")
 args = ap.parse_args()
 DEV, GS = "cuda", 128
 
-ext = load(name="sparse_int4_ext", sources=["sparse_int4_ext.cu"],
+ext = load(name="sparse_int4_ext_gs", sources=["sparse_int4_ext_gs.cu"],
            extra_cuda_cflags=["-O3", "-arch=sm_89"], verbose=False)
 tok = AutoTokenizer.from_pretrained(args.model)
 model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.float16,
@@ -53,7 +54,8 @@ def install(mod, thr):
         return F.linear(x, W)
     mod.forward = fwd
 
-for _, m in layers: install(m, args.thr)
+if not args.fp16:
+    for _, m in layers: install(m, args.thr)
 cfg = model.config
 prompt_ids = tok(args.prompt, return_tensors="pt").input_ids.to(DEV)
 P = prompt_ids.shape[1]
@@ -98,24 +100,26 @@ def graphed():
             step()
     torch.cuda.current_stream().wait_stream(s)
 
-    # capture at pos P (input = cur, which lives at position P) -> predicts token P+1
+    # capture one decode step
     g = torch.cuda.CUDAGraph()
     static_in.copy_(cur); static_pos.fill_(P); static_pid.fill_(P)
     with torch.cuda.graph(g):
         static_out = step()
 
-    # timed loop — NO reset; cache flows continuously. seq = [cur, capture out, replays...]
+    # reset to a CLEAN cache and re-prefill, then replay the timed loop from pos P
+    cache.reset()
+    o = model(prompt_ids, position_ids=pos.unsqueeze(0), cache_position=pos,
+              past_key_values=cache, use_cache=True)
+    cur = o.logits[:, -1].argmax(-1, keepdim=True)
     torch.cuda.synchronize(); t = time.time()
-    toks = [cur.item()]
-    nxt = static_out[:, -1].argmax(-1, keepdim=True)          # token at P+1 from capture
-    toks.append(nxt.item())
-    for i in range(2, args.ntok):
-        static_in.copy_(nxt); static_pos.fill_(P + i - 1); static_pid.fill_(P + i - 1)
+    toks = [cur.item()]; nxt = cur
+    for i in range(args.ntok):
+        static_in.copy_(nxt); static_pos.fill_(P + i); static_pid.fill_(P + i)
         g.replay()
         nxt = static_out[:, -1].argmax(-1, keepdim=True)
         toks.append(nxt.item())
     torch.cuda.synchronize()
-    return args.ntok / (time.time() - t), toks
+    return args.ntok / (time.time() - t), toks[:args.ntok]
 
 print(f"model: {args.model}  int4 thr={args.thr}  decoding {args.ntok} tokens\n")
 e, e_toks = eager();   print(f"eager   decode : {e:6.1f} tok/s")
