@@ -42,26 +42,39 @@ Two wins in one pass, in registers:
 
 The optimization ladder — each step measured, dense fp16 = 16.7 tok/s baseline:
 
-| step | tok/s | vs dense | coherent? |
-|---|---:|---:|:--:|
-| PyTorch dense fp16 | 16.7 | 1.0× | — |
-| Triton fp16 sparse (leankv original) | 22.2 | 1.31× | ✅ |
-| int4, unfused | 17.8 | 1.07× | ✅ |
-| **+ fuse QKV & gate/up** | 27.1 | 1.62× | ✅ |
-| **+ tune split-K (BLOCK_K 512→128)** | 36–38 | ~2.2× | ✅ |
-| **+ CUDA graph** | **45.3** | **2.71×** | ✅ 128/128 |
-| + uncalibrated sparsity | **72.2** | **4.3×** | ⚠️ speed only |
+| step | tok/s | vs dense |
+|---|---:|---:|
+| PyTorch dense fp16 | 16.7 | 1.0× |
+| Triton fp16 sparse (leankv original) | 22.2 | 1.31× |
+| int4, unfused | 17.8 | 1.07× |
+| + fuse QKV & gate/up into one kernel each | 27.1 | 1.62× |
+| + tune split-K (BLOCK_K 512→128) | ~37 | ~2.2× |
+| + CUDA graph (int4 weights, no sparsity) | **45.3** | **2.71×** |
+| + calibrated 40% activation sparsity | **64.2** | **3.84×** |
+| + 50% sparsity | 69.8 | 4.18× |
 
-- **45.3 tok/s is the quality-preserving result** (int4 weights, no sparsity, coherent,
-  128/128 tokens match eager) — 2.7× over dense, 2× over the Triton baseline.
-- **72.2 tok/s** adds sparsity for a pure *speed* number; the threshold is uncalibrated
-  so quality degrades (calibration would preserve it — separate axis).
+Levers by impact: **fusion** (project'ns that share an input → one concatenated int4
+GEMV) > **split-K tuning** (more blocks fill the GPU) > **CUDA graph**. The graph
+helps *only* once fusion+tuning made decode launch-bound rather than weight-bound —
+it was ~1.02× when weight-bound. CUDA-graph gotcha: custom kernels must launch on
+`at::cuda::getCurrentCUDAStream()` or capture records an empty graph (fast garbage).
 
-Levers, in order of impact: **fusion** (share input → concatenated GEMV) > **split-K
-tuning** (more blocks fill the GPU) > **CUDA graph** (helps *only* once fusion+tuning
-made decode launch-bound rather than weight-bound; earlier it was ~1.02×). Key
-CUDA-graph gotcha: custom kernels must launch on `at::cuda::getCurrentCUDAStream()`
-or capture records an empty graph (fast garbage).
+## Quality (WikiText-2 perplexity) — the honest trade
+
+| config | perplexity | Δ vs fp16 | decode tok/s |
+|---|---:|---:|---:|
+| fp16 baseline | 5.05 | — | 16.7 |
+| **int4 weights** | 5.26 | **+4%** | **45.3** |
+| int4 + 40% calibrated sparsity | 5.92 | +17% | 64.2 |
+
+**int4 weight quantization is nearly lossless (+4% ppl) for a 2.7× speedup** — that's
+the clean operating point. Adding 40% activation sparsity buys another 1.4× (to 3.8×)
+but costs ~17% perplexity: a real speed/quality trade, not free. Calibration
+(`calibrate_simple.py`) picks per-projection thresholds; the sparsity axis is where the
+quality goes, so it's opt-in.
+
+Try it: `python3 chat.py --thresholds thresholds.json` streams generation live at the
+fast-path speed.
 
 ## In-model correctness
 
@@ -74,30 +87,45 @@ own dense path.
 
 ```
 leankv/teal/kernels/
-├── sparse_gemv.py            # original Triton kernel (the starting point)
-└── cuda/                     # this work — see cuda/README.md for details
-    ├── sparse_gemv.cu        # fp16 kernel + bandwidth benchmark
-    ├── sparse_int4_gemv.cu   # fused sparse-int4 kernel (the headline)
-    ├── forward_test.py       # in-model correctness vs fp32 ground truth
-    ├── bench_forward.py      # end-to-end decode tok/s
-    ├── sparse_gemv_hip.cpp   # HIP/CDNA port for AMD MI300X
-    └── DESIGN_sparse_int4.md # design + phase plan
+├── sparse_gemv.py               # original Triton kernel (the starting point)
+└── cuda/                        # this work — see cuda/README.md for details
+    ├── sparse_gemv.cu           # fp16 kernel + bandwidth benchmark (ties Triton, 85%)
+    ├── sparse_int4_gemv.cu      # fused sparse-int4 kernel + correctness (3.2× kernel)
+    ├── sparse_int4_gemv_lop3.cu # LOP3 half2 int4→fp16 unpack (naive vs LOP3)
+    ├── sparse_int4_ext_gs.cu    # graph-safe fused-int4 ext (tunable split-K)
+    ├── bench_int4_fused.py       # fused QKV + gate/up decode benchmark
+    ├── bench_int4_fused_graph.py # fused + CUDA graph + calibrated thresholds
+    ├── calibrate_simple.py       # per-layer activation-sparsity thresholds
+    ├── ppl.py                    # WikiText-2 perplexity (fp16 / int4 / int4+sparse)
+    ├── chat.py                   # streaming chat on the fast path (feel the speed)
+    ├── forward_test.py           # in-model correctness vs fp32 ground truth
+    ├── sparse_gemv_hip.cpp       # HIP/CDNA port for AMD MI300X
+    └── DESIGN_sparse_int4.md     # design + phase plan
 ```
 
-## Build
+## Build & run
 
 ```bash
-nvcc -O3 -arch=sm_89 leankv/teal/kernels/cuda/sparse_gemv.cu      -o k && ./k
-nvcc -O3 -arch=sm_89 leankv/teal/kernels/cuda/sparse_int4_gemv.cu -o k && ./k
+cd leankv/teal/kernels/cuda
+nvcc -O3 -arch=sm_89 sparse_gemv.cu       -o k && ./k    # fp16 bandwidth (85%)
+nvcc -O3 -arch=sm_89 sparse_int4_gemv.cu  -o k && ./k    # fused sparse-int4 kernel
+
+# end-to-end (needs torch; L4 / sm_89)
+python3 calibrate_simple.py --sparsity 0.40           # -> thresholds.json
+python3 bench_int4_fused_graph.py --thresholds thresholds.json   # 64 tok/s
+python3 ppl.py --thresholds thresholds.json           # quality
+python3 chat.py --thresholds thresholds.json          # interactive, streaming
 ```
 
 ## Status (honest)
 
-- int4 kernel: standalone-tested (3.2× kernel-level) **and** end-to-end on Mistral-7B
-  (1.07× dense at int4 alone, up to 1.45× with sparsity — beats Triton's 22.2 tok/s).
-- int4 uses a **naive unpack**; the `LOP3` optimization (raises the 70% back up) is next.
-- int4 **weight-quant quality** (perplexity) not yet measured — separate axis.
-- HIP kernel is **not run on AMD hardware** yet (no MI300X). All numbers are NVIDIA L4.
+- Kernel: standalone 3.2× vs Triton; **end-to-end 45 tok/s (int4, +4% ppl) → 64 tok/s
+  (40% sparse, +17% ppl)** on Mistral-7B, L4 — from a 16.7 dense baseline.
+- **LOP3 unpack** done (~1.06× kernel, negligible in-model — decode is bandwidth/occupancy
+  bound, not unpack bound).
+- **CUDA graphs** help only after fusion+tuning make decode launch-bound (1.02× → 1.2–2×).
+- **HIP kernel not run on AMD hardware** yet (no MI300X). All numbers are NVIDIA L4;
+  MI300X (~5.3 TB/s, ~11× the bandwidth) is the next multiplier.
 
 ---
 

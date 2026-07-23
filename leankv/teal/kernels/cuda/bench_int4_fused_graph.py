@@ -18,9 +18,13 @@ ap.add_argument("--model", default="mistralai/Mistral-7B-v0.3")
 ap.add_argument("--ntok", type=int, default=128)
 ap.add_argument("--thr", type=float, default=0.0)
 ap.add_argument("--blockk", type=int, default=128)
+ap.add_argument("--thresholds", default="", help="calibrated thresholds.json (per-layer)")
 ap.add_argument("--prompt", default="Explain memory-bound GPU kernels in detail:")
 args = ap.parse_args()
 DEV, GS = "cuda", 128
+import json
+TH = json.load(open(args.thresholds)) if args.thresholds else {}
+def tget(i, kind): return TH.get(f"{i}_{kind}", args.thr)
 
 ext = load(name=f"sparse_int4_ext_gs_bk{args.blockk}", sources=["sparse_int4_ext_gs.cu"],
            extra_cuda_cflags=["-O3", "-arch=sm_89", f"-DBLOCK_K={args.blockk}"], verbose=False)
@@ -40,38 +44,38 @@ def quantize_int4(W):
     return packed.to(DEV), scale.squeeze(2).t().contiguous().half().to(DEV)
 
 @torch.no_grad()
-def install_single(mod):
+def install_single(mod, tv):
     Wp, Sc = quantize_int4(mod.weight); w = mod.weight.data
-    mod.forward = lambda x, Wp=Wp, Sc=Sc, w=w: ext.sparse_int4_gemv(x, Wp, Sc, thr) if dec(x) else F.linear(x, w)
+    mod.forward = lambda x, Wp=Wp, Sc=Sc, w=w, tv=tv: ext.sparse_int4_gemv(x, Wp, Sc, tv) if dec(x) else F.linear(x, w)
 
 @torch.no_grad()
 def install_fused(model):
-    for layer in model.model.layers:
+    for i, layer in enumerate(model.model.layers):
         at, mlp = layer.self_attn, layer.mlp
         Wp, Sc = quantize_int4(torch.cat([at.q_proj.weight, at.k_proj.weight, at.v_proj.weight], 0))
         st = {"W": Wp, "S": Sc, "nq": at.q_proj.out_features, "nk": at.k_proj.out_features, "k": None, "v": None,
-              "wq": at.q_proj.weight.data, "wk": at.k_proj.weight.data, "wv": at.v_proj.weight.data}
+              "t": tget(i, "qkv"), "wq": at.q_proj.weight.data, "wk": at.k_proj.weight.data, "wv": at.v_proj.weight.data}
         def q_fwd(x, st=st):
             if dec(x):
-                y = ext.sparse_int4_gemv(x, st["W"], st["S"], thr); nq, nk = st["nq"], st["nk"]
+                y = ext.sparse_int4_gemv(x, st["W"], st["S"], st["t"]); nq, nk = st["nq"], st["nk"]
                 st["k"] = y[..., nq:nq + nk].contiguous(); st["v"] = y[..., nq + nk:].contiguous()
                 return y[..., :nq].contiguous()
             return F.linear(x, st["wq"])
         at.q_proj.forward = q_fwd
         at.k_proj.forward = (lambda x, st=st: st["k"] if dec(x) else F.linear(x, st["wk"]))
         at.v_proj.forward = (lambda x, st=st: st["v"] if dec(x) else F.linear(x, st["wv"]))
-        install_single(at.o_proj)
+        install_single(at.o_proj, tget(i, "o"))
         Wp2, Sc2 = quantize_int4(torch.cat([mlp.gate_proj.weight, mlp.up_proj.weight], 0))
         gt = {"W": Wp2, "S": Sc2, "ng": mlp.gate_proj.out_features, "u": None,
-              "wg": mlp.gate_proj.weight.data, "wu": mlp.up_proj.weight.data}
+              "t": tget(i, "gateup"), "wg": mlp.gate_proj.weight.data, "wu": mlp.up_proj.weight.data}
         def gate_fwd(x, gt=gt):
             if dec(x):
-                y = ext.sparse_int4_gemv(x, gt["W"], gt["S"], thr); ng = gt["ng"]
+                y = ext.sparse_int4_gemv(x, gt["W"], gt["S"], gt["t"]); ng = gt["ng"]
                 gt["u"] = y[..., ng:].contiguous(); return y[..., :ng].contiguous()
             return F.linear(x, gt["wg"])
         mlp.gate_proj.forward = gate_fwd
         mlp.up_proj.forward = (lambda x, gt=gt: gt["u"] if dec(x) else F.linear(x, gt["wu"]))
-        install_single(mlp.down_proj)
+        install_single(mlp.down_proj, tget(i, "down"))
 
 install_fused(model)
 cfg = model.config
