@@ -19,11 +19,16 @@ ap.add_argument("--model", default="mistralai/Mistral-7B-v0.3")
 ap.add_argument("--ntok", type=int, default=128)
 ap.add_argument("--thr", type=float, default=0.0)
 ap.add_argument("--prompt", default="Explain memory-bound GPU kernels in detail:")
+ap.add_argument("--ext", default="sparse_int4_ext", help="ext source (without .cu)")
+ap.add_argument("--blockk", type=int, default=0, help="override BLOCK_K (split-K tile)")
 args = ap.parse_args()
 DEV, GS = "cuda", 128
 
-ext = load(name="sparse_int4_ext", sources=["sparse_int4_ext.cu"],
-           extra_cuda_cflags=["-O3", "-arch=sm_89"], verbose=False)
+_flags = ["-O3", "-arch=sm_89"]
+_name = args.ext
+if args.blockk:
+    _flags.append(f"-DBLOCK_K={args.blockk}"); _name = f"{args.ext}_bk{args.blockk}"
+ext = load(name=_name, sources=[args.ext + ".cu"], extra_cuda_cflags=_flags, verbose=False)
 tok = AutoTokenizer.from_pretrained(args.model)
 model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.float16).to(DEV).eval()
 

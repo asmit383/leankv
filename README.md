@@ -38,26 +38,30 @@ Two wins in one pass, in registers:
 - **int4** — weights stay packed in HBM (0.5 B vs fp16's 2 B), unpacked in registers,
   never written back as fp16
 
-## End-to-end on Mistral-7B (batch-1 decode tok/s)
+## End-to-end on Mistral-7B (batch-1 decode tok/s, L4)
 
-| config | tok/s | vs dense |
-|---|---:|---:|
-| PyTorch dense fp16 | 16.7 | 1.0× |
-| Triton fp16 sparse (leankv original) | 22.2 | 1.31× |
-| int4, unfused | 17.8 | 1.07× |
-| **fused int4** (QKV + gate/up in one kernel) | **27.1** | **1.62×** |
-| fused int4 + sparsity | **35.4** | **2.12×** |
+The optimization ladder — each step measured, dense fp16 = 16.7 tok/s baseline:
 
-Fusing the projections that share an input (q/k/v; gate/up) into single concatenated
-int4 GEMVs takes int4 from 17.8 → 27.1 (+52%): fewer, bigger kernels → better
-occupancy. The 27.1 (1.62×) case is coherent (beats the Triton fp16 result); the
-2.12× case adds uncalibrated sparsity (speed only — int4 quant + sparsity quality is
-a separate axis). Memory ceiling on L4 is ~85 tok/s (dense int4).
+| step | tok/s | vs dense | coherent? |
+|---|---:|---:|:--:|
+| PyTorch dense fp16 | 16.7 | 1.0× | — |
+| Triton fp16 sparse (leankv original) | 22.2 | 1.31× | ✅ |
+| int4, unfused | 17.8 | 1.07× | ✅ |
+| **+ fuse QKV & gate/up** | 27.1 | 1.62× | ✅ |
+| **+ tune split-K (BLOCK_K 512→128)** | 36–38 | ~2.2× | ✅ |
+| **+ CUDA graph** | **45.3** | **2.71×** | ✅ 128/128 |
+| + uncalibrated sparsity | **72.2** | **4.3×** | ⚠️ speed only |
 
-**CUDA graphs were a dead end here** (`bench_int4_graph.py`): once correct (a kernel
-must launch on the capture stream, not the default stream, or the graph is empty),
-graph replay is only ~1.02× — batch-1 decode on a 7B is GPU-bound, not
-launch-overhead-bound. The real lever was kernel fusion, above.
+- **45.3 tok/s is the quality-preserving result** (int4 weights, no sparsity, coherent,
+  128/128 tokens match eager) — 2.7× over dense, 2× over the Triton baseline.
+- **72.2 tok/s** adds sparsity for a pure *speed* number; the threshold is uncalibrated
+  so quality degrades (calibration would preserve it — separate axis).
+
+Levers, in order of impact: **fusion** (share input → concatenated GEMV) > **split-K
+tuning** (more blocks fill the GPU) > **CUDA graph** (helps *only* once fusion+tuning
+made decode launch-bound rather than weight-bound; earlier it was ~1.02×). Key
+CUDA-graph gotcha: custom kernels must launch on `at::cuda::getCurrentCUDAStream()`
+or capture records an empty graph (fast garbage).
 
 ## In-model correctness
 
