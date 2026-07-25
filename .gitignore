@@ -9,3 +9,10 @@ results/
 *.pt
 *.bin
 .env
+
+# personal / local-only (never push)
+interview.md
+reply_draft.md
+leankv/teal/kernels/cuda/reply_draft.md
+.DS_Store
+**/.DS_Store
