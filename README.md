@@ -59,19 +59,31 @@ helps *only* once fusion+tuning made decode launch-bound rather than weight-boun
 it was ~1.02× when weight-bound. CUDA-graph gotcha: custom kernels must launch on
 `at::cuda::getCurrentCUDAStream()` or capture records an empty graph (fast garbage).
 
+> **Scope (honest):** this is a **HuggingFace `transformers` extension**, not a
+> standalone inference engine. The kernels are wired in by monkeypatching each
+> `Linear.forward` and running through `model.generate` / `StaticCache`. That framework
+> overhead is *why* decode sits at ~half the L4 memory ceiling (~62 of ~110 tok/s) — the
+> kernel itself is faster than the harness lets it show. A lean stack (no Python in the
+> hot loop, fused attention) would close the gap; the real multiplier past that is
+> hardware — the same kernel on an H200 (4.8 TB/s) would run ~10× faster.
+
 ## Quality (WikiText-2 perplexity) — the honest trade
 
-| config | perplexity | Δ vs fp16 | decode tok/s |
-|---|---:|---:|---:|
-| fp16 baseline | 5.05 | — | 16.7 |
-| **int4 weights** | 5.26 | **+4%** | **45.3** |
-| int4 + 40% calibrated sparsity | 5.92 | +17% | 64.2 |
+Measured on both the base and Instruct 7B (same architecture → identical speed):
 
-**int4 weight quantization is nearly lossless (+4% ppl) for a 2.7× speedup** — that's
-the clean operating point. Adding 40% activation sparsity buys another 1.4× (to 3.8×)
-but costs ~17% perplexity: a real speed/quality trade, not free. Calibration
-(`calibrate_simple.py`) picks per-projection thresholds; the sparsity axis is where the
-quality goes, so it's opt-in.
+| config | Mistral-7B base | Mistral-7B-**Instruct** | decode tok/s |
+|---|---:|---:|---:|
+| fp16 baseline | 5.05 | 5.22 | 16.7 |
+| **int4 weights** | 5.26 (+4%) | 5.40 (+3.5%) | **45** |
+| int4 + 40% sparsity | 5.92 (+17%) | **5.65 (+8%)** | **62** |
+
+- **int4 weights are nearly lossless (~+4%)** for a 2.7× speedup — the clean operating point.
+- **40% activation sparsity** pushes to ~62 tok/s; on the **Instruct** model it costs only
+  **+8% perplexity** (it tolerates sparsity far better than the base's +17%), with coherent,
+  **instruction-following** output. Sparsity is the opt-in speed/quality knob.
+- `chat.py` runs **Mistral-7B-Instruct-v0.3** at this config — a real streaming chatbot at
+  ~62 tok/s decode. A *greedy* threshold-allocation experiment (`calibrate_greedy.py`)
+  **failed** (over-pruned sensitive projections, +115% ppl) — kept as an honest negative.
 
 Try it: `python3 chat.py --thresholds thresholds.json` streams generation live at the
 fast-path speed.
@@ -119,13 +131,16 @@ python3 chat.py --thresholds thresholds.json          # interactive, streaming
 
 ## Status (honest)
 
-- Kernel: standalone 3.2× vs Triton; **end-to-end 45 tok/s (int4, +4% ppl) → 64 tok/s
-  (40% sparse, +17% ppl)** on Mistral-7B, L4 — from a 16.7 dense baseline.
+- Kernel: standalone 3.2× vs Triton; **end-to-end 45 tok/s (int4, ~+4% ppl) → 62 tok/s
+  (40% sparse)** on Mistral-7B, L4 — from a 16.7 dense baseline. On **Mistral-7B-Instruct**
+  the 40%-sparse config is **+8% ppl** with coherent chat (`chat.py`).
+- **HuggingFace `transformers` extension**, not a standalone engine — decode runs at ~half
+  the memory ceiling because of framework overhead, not the kernel (see Scope note above).
 - **LOP3 unpack** done (~1.06× kernel, negligible in-model — decode is bandwidth/occupancy
   bound, not unpack bound).
 - **CUDA graphs** help only after fusion+tuning make decode launch-bound (1.02× → 1.2–2×).
 - **HIP kernel not run on AMD hardware** yet (no MI300X). All numbers are NVIDIA L4;
-  MI300X (~5.3 TB/s, ~11× the bandwidth) is the next multiplier.
+  MI300X (~5.3 TB/s) / H200 (4.8 TB/s, ~16× the bandwidth) is the real next multiplier.
 
 ---
 
