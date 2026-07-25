@@ -17,8 +17,8 @@ logging.getLogger("transformers").setLevel(logging.ERROR)
 from torch.utils.cpp_extension import load
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--model", default="mistralai/Mistral-7B-v0.3")
-ap.add_argument("--thresholds", default="thresholds.json")
+ap.add_argument("--model", default="mistralai/Mistral-7B-Instruct-v0.3")
+ap.add_argument("--thresholds", default="thresholds_uniform.json")
 ap.add_argument("--blockk", type=int, default=128)
 ap.add_argument("--maxtok", type=int, default=200)
 ap.add_argument("--once", action="store_true", help="read one prompt from stdin and exit")
@@ -102,10 +102,16 @@ si.fill_(1); sp.fill_(0); pid.fill_(0)
 with torch.cuda.graph(g), torch.no_grad():
     so = step()
 
+messages = []  # conversation history (multi-turn)
+
 @torch.no_grad()
-def generate(prompt):
+def generate(user_msg):
+    messages.append({"role": "user", "content": user_msg})
+    ids = tok.apply_chat_template(messages, add_generation_prompt=True, return_tensors="pt").to(DEV)
+    if ids.shape[1] >= MAXLEN - args.maxtok:      # conversation too long → start fresh
+        del messages[:-1]
+        ids = tok.apply_chat_template(messages, add_generation_prompt=True, return_tensors="pt").to(DEV)
     cache.reset()
-    ids = tok(prompt, return_tensors="pt").input_ids.to(DEV)
     P = ids.shape[1]
     ar = torch.arange(P, device=DEV)
     nxt = model(ids, position_ids=ar.unsqueeze(0), cache_position=ar,
@@ -121,12 +127,13 @@ def generate(prompt):
         si.copy_(nxt); sp.fill_(P + i); pid.fill_(P + i); g.replay()
         nxt = so[:, -1].argmax(-1, keepdim=True)
     dt = time.time() - t0
+    messages.append({"role": "assistant", "content": tok.decode(out, skip_special_tokens=True)})
     print(f"\n\033[90m[{len(out)} tokens · {len(out)/dt:.1f} tok/s]\033[0m")
 
 if args.once:
     generate(sys.stdin.read().strip()); sys.exit(0)
 
-print("\nMistral-7B · fused int4 + CUDA graph. Type a prompt (Ctrl-C to quit).\n")
+print(f"\n{args.model.split('/')[-1]} · fused int4 + CUDA graph. Chat away (Ctrl-C to quit).\n")
 while True:
     try:
         p = input("\033[1m>>> \033[0m")
