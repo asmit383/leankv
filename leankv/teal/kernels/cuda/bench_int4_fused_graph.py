@@ -19,6 +19,7 @@ ap.add_argument("--ntok", type=int, default=128)
 ap.add_argument("--thr", type=float, default=0.0)
 ap.add_argument("--blockk", type=int, default=128)
 ap.add_argument("--thresholds", default="", help="calibrated thresholds.json (per-layer)")
+ap.add_argument("--ext", default="sparse_int4_ext_gs", help="ext source (gs=two-pass safe, lop3=atomic)")
 ap.add_argument("--prompt", default="Explain memory-bound GPU kernels in detail:")
 args = ap.parse_args()
 DEV, GS = "cuda", 128
@@ -26,7 +27,7 @@ import json
 TH = json.load(open(args.thresholds)) if args.thresholds else {}
 def tget(i, kind): return TH.get(f"{i}_{kind}", args.thr)
 
-ext = load(name=f"sparse_int4_ext_gs_bk{args.blockk}", sources=["sparse_int4_ext_gs.cu"],
+ext = load(name=f"{args.ext}_bk{args.blockk}", sources=[args.ext + ".cu"],
            extra_cuda_cflags=["-O3", "-arch=sm_89", f"-DBLOCK_K={args.blockk}"], verbose=False)
 tok = AutoTokenizer.from_pretrained(args.model)
 model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.float16).to(DEV).eval()
